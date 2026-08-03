@@ -136,20 +136,23 @@ takes `--user`; the UI has a user picker.
 `docker compose up` starts the services that form the whole workflow:
 
 ```
-                              proxy (Caddy, TLS on 80/443)
-                                │  /api/* → api,  else → frontend
-neo4j ─┐                        ▼
-redis ─┼─▶ api ──(healthy?)──▶ frontend   (React UI, nginx)
+                    proxy (Caddy, TLS on 80/443)
+                      │  /api/*   → api:8000
+                      │  /admin/* → /srv/admin   (admin console SPA)
+neo4j ─┐              │  /*       → /srv/app     (chat SPA)
+redis ─┼─▶ api ◀──────┘
        │   (FastAPI)
        ├─▶ worker  (Arq — runs ingestion off the API, resource-capped)
        └── ollama  (optional, `local` profile — runs open models)
 ```
 
-The **proxy** is the public entrypoint: it terminates TLS (automatic Let's
-Encrypt for a real domain, self-signed for `localhost`), forwards `/api/*` to the
-API with response buffering off so SSE streams, and serves everything else from
-the frontend. Because the UI and API are same-origin behind it, CORS isn't
-needed in that path.
+The **proxy** is the public entrypoint and the only container the network can
+reach. It terminates TLS (automatic Let's Encrypt for a real domain,
+self-signed for `localhost`), forwards `/api/*` to the API with response
+buffering off so SSE streams, and serves both web apps' static files itself —
+they are built into its image by `docker/Dockerfile.proxy`. Because everything
+shares one origin, CORS isn't needed in that path and one session cookie
+covers both apps without being widened to a domain scope.
 
 Ingestion is **queued**: an upload enqueues a job on Redis, the `worker` picks it
 up and runs the (blocking) embed + graph-extraction pipeline, and job status is
@@ -161,14 +164,20 @@ The ordering is health-gated, so "the UI is up" means "the stack is up":
 
 - `neo4j` and `redis` expose healthchecks; `api` waits for both to be healthy
   before starting.
-- `api` exposes its own healthcheck (`/health`); `frontend` waits for `api` to be
+- `api` exposes its own healthcheck (`/health`); `proxy` waits for `api` to be
   healthy. Its `start_period` is generous because the first request may download
   local models.
 
-The **frontend is a served part of the stack**, not a dev-only tool: its own
-nginx container serves the built React app and proxies `/api/*` to the backend
-(the same proxy handles SSE streaming). Everything a user needs is in the
-browser:
+**Two web apps, one origin.** `frontend/` is the chat app served at `/`;
+`admin/` is the operator console served at `/admin`. They are independent npm
+projects with no shared code — the console has its own small API client
+covering only the endpoints it calls, and its own components. They share the
+CSS-variable token palette (duplicated, deliberately) so they read as one
+product while remaining separately buildable and separately deployable.
+
+Both are built into the proxy image and served as static files; navigating
+between them is a full page load, which is what keeps the admin bundle out of
+the end-user one. Everything a user needs is in the browser:
 
 - a **status bar** that polls `/ready` and shows API / Neo4j / Redis health,
 - a **drag-and-drop upload** that runs the ingest pipeline and streams per-file

@@ -1,12 +1,13 @@
-# Reverse proxy + TLS termination.
+# Reverse proxy, TLS, and static hosting for both web apps.
 #
 # SITE_ADDRESS controls TLS:
-#   :80                     plain HTTP (default; local dev, no certs)
+#   :80                     plain HTTP (local dev, no certs)
 #   localhost               HTTPS with Caddy's local self-signed CA
 #   rag.example.com         HTTPS with automatic Let's Encrypt (set TLS_EMAIL)
 #
-# Behind this proxy the UI and API share one origin, so no CORS is needed.
-
+# One origin serves three things: the chat app at /, the admin console at
+# /admin, and the API at /api. Same-origin means no CORS, and it means the
+# session cookie works for both apps without being widened to a domain scope.
 {
 	# Quoted so an unset TLS_EMAIL renders as an empty argument rather than a
 	# bare `email`, which Caddy rejects at parse time. Only used when
@@ -14,19 +15,123 @@
 	email "{$TLS_EMAIL}"
 }
 
+# Static SPA hosting: hashed assets cached hard, the entry document never.
+# Defined here, above its use — a snippet declared after the site block that
+# imports it is not in scope, and the adapter fails with "File to import not
+# found".
+#
+# Two MUTUALLY EXCLUSIVE matchers rather than a default plus an override. A
+# bare `header` followed by `header @immutable` looks equivalent and is not:
+# both handlers run, the unmatched one runs last, and every hashed asset comes
+# back `no-store`. That version validates, serves correctly, and silently
+# defeats caching — so the rule is written twice with `not` instead of once
+# with an override.
+#
+# Vite fingerprints asset filenames, so /assets/* can be cached forever: the
+# name changes whenever the content does. index.html must NEVER be cached,
+# because it names those hashed bundles — a stale copy pins the browser to a
+# build that no longer exists, and since the browser then serves it from its
+# own cache it stops asking the server at all. A rebuilt app never reaches the
+# user, reloads included.
+(spa) {
+	@immutable path /assets/*
+	header @immutable Cache-Control "public, max-age=31536000, immutable"
+	@entry not path /assets/*
+	header @entry Cache-Control "no-store, no-cache, must-revalidate"
+	try_files {path} /index.html
+	file_server
+}
+
 {$SITE_ADDRESS::80} {
 	encode gzip
 
+	header {
+		# Sent only over HTTPS by Caddy, so this is inert on a :80 dev run.
+		# Two years with preload is the submission requirement; it also means a
+		# mistake here is expensive to undo, which is the point of the flag.
+		Strict-Transport-Security "max-age=63072000; includeSubDomains; preload"
+		X-Content-Type-Options "nosniff"
+		# The API is same-origin behind this proxy, so nothing needs to frame us.
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		# Nothing in this app uses a camera, mic or location.
+		Permissions-Policy "geolocation=(), microphone=(), camera=()"
+		# Don't advertise the server software.
+		-Server
+	}
+
+	# The API's own schema and operational data. `api.docs_enabled: false` and
+	# `api.metrics_public: false` already withhold these in the production
+	# profile; blocking them here as well means a profile edit, a stray env var
+	# or a future default flipping back cannot quietly republish them. Two
+	# independent controls, because "the admin API is documented publicly" is
+	# not a mistake worth risking on one.
+	#
+	# They stay reachable from the box itself on 127.0.0.1:8000, where this
+	# proxy is not in the path — so `curl localhost:8000/metrics` over an SSH
+	# tunnel still works for operators.
+	# This MUST be a `handle` block. A bare `respond @matcher` is sorted by
+	# Caddy's *directive* order, which places it after `handle`, so
+	# `handle_path /api/*` below would match first and proxy the request
+	# through — leaving this rule silently dead.
+	#
+	# Sibling `handle` blocks are mutually exclusive, and Caddy orders them by
+	# path specificity rather than by the order written here. That is what makes
+	# this win over `/api/*`: these paths are longer and more specific. Do not
+	# rely on writing order anywhere in this file — check `caddy adapt` output
+	# if you change the shape of a matcher.
+	@internal_only path /api/docs* /api/redoc* /api/openapi.json /api/metrics*
+	handle @internal_only {
+		respond 404
+	}
+
 	# API — strip the /api prefix and forward to the backend.
-	# flush_interval -1 disables response buffering so SSE streaming works.
 	handle_path /api/* {
+		# Replaces the upload cap the frontend's nginx used to hold. Keep it
+		# >= api.max_upload_mb, or a large upload dies as a bare 413 before the
+		# API can apply its own limit and say something useful.
+		request_body {
+			max_size {$MAX_UPLOAD_MB:25}MB
+		}
 		reverse_proxy api:8000 {
+			# Disable response buffering so SSE streaming works.
 			flush_interval -1
+
+			# The per-IP limits on /auth/* and the address recorded against each
+			# session both need the real caller. X-Forwarded-For is APPENDED to
+			# whatever the client sent, so its first hop is attacker-controlled;
+			# this header is SET by us and therefore cannot be forged from
+			# outside. `graphrag.api.ratelimit.client_ip` reads it first.
+			#
+			# Without it every request would arrive from this container's
+			# address, and a per-IP limit keyed on that is a global limit — one
+			# attacker would lock out every user at once.
+			header_up X-Real-IP {remote_host}
 		}
 	}
 
-	# Everything else: the static React app.
+	# The admin console: a separate SPA with its own root. Bare /admin has to
+	# gain the trailing slash first, or the bundle's relative asset URLs resolve
+	# against / and fetch the chat app's files instead.
+	#
+	# `redir * /admin/ 301`, with the explicit `*` matcher — NOT
+	# `redir /admin/ 301`. Any directive whose first argument starts with `/`
+	# has that argument parsed as an inline path matcher, so the short form
+	# silently becomes "for requests to /admin/, respond 301 to nowhere" and
+	# serves an empty 200 instead.
+	@admin_root path /admin
+	handle @admin_root {
+		redir * /admin/ 301
+	}
+
+	handle_path /admin/* {
+		root * /srv/admin
+		import spa
+	}
+
+	# Everything else: the chat app.
 	handle {
-		reverse_proxy frontend:80
+		root * /srv/app
+		import spa
 	}
 }

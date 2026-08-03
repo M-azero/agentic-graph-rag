@@ -24,7 +24,7 @@ from graphrag.core.logging import configure_logging, get_logger
 from graphrag.embeddings.base import Embedder
 from graphrag.ingestion.chunking import build_chunker
 from graphrag.ingestion.extraction import LLMGraphExtractor
-from graphrag.llm import build_chat_model
+from graphrag.llm import build_chat_chain
 from graphrag.ocr import build_ocr
 from graphrag.retrieval import (
     GraphAugmentedRetriever,
@@ -173,12 +173,22 @@ class Container:
             return CachedEmbedder(base, self.redis, cfg.model, cfg.cache.ttl_seconds)
         return base
 
+    def _failover(self) -> dict:
+        """Breaker tuning, shared by every chain (chat, OCR, rerank, extraction)."""
+        c = self.settings.llm
+        return {
+            "max_failures": c.failover_max_failures,
+            "cooldown_seconds": c.failover_cooldown_seconds,
+        }
+
     @cached_property
     def llm(self):
         c = self.settings.llm
-        return build_chat_model(
+        return build_chat_chain(
             c.provider, c.model, self.secrets,
+            fallbacks=c.fallbacks,
             temperature=c.temperature, max_tokens=c.max_tokens, extra=c.extra,
+            **self._failover(),
         )
 
     def chat_model(self, provider: str, model: str):
@@ -186,15 +196,21 @@ class Container:
         pair, cached per pair. The default pair reuses `llm` so extraction and
         chat share one client. Provider `extra` kwargs (e.g. Anthropic
         thinking) apply only to the configured default — they are model-
-        specific and must not leak onto overrides."""
+        specific and must not leak onto overrides.
+
+        A user-selected model gets the same fallback chain as the default: the
+        alternative is that picking a model from the UI silently opts out of
+        failover, so one dead provider breaks chat for whoever chose it."""
         c = self.settings.llm
         if (provider, model) == (c.provider, c.model):
             return self.llm
         key = (provider, model)
         if key not in self._chat_models:
-            self._chat_models[key] = build_chat_model(
+            self._chat_models[key] = build_chat_chain(
                 provider, model, self.secrets,
+                fallbacks=c.fallbacks,
                 temperature=c.temperature, max_tokens=c.max_tokens,
+                **self._failover(),
             )
         return self._chat_models[key]
 
@@ -205,9 +221,11 @@ class Container:
         cfg = self.settings.ingestion.llm
         if cfg is None:
             return self.llm
-        return build_chat_model(
+        return build_chat_chain(
             cfg.provider, cfg.model, self.secrets,
+            fallbacks=cfg.fallbacks,
             temperature=cfg.temperature, max_tokens=cfg.max_tokens, extra=cfg.extra,
+            **self._failover(),
         )
 
     @cached_property

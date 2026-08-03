@@ -15,6 +15,7 @@ from arq.connections import RedisSettings
 from graphrag.config.settings import Secrets
 from graphrag.container import Container
 from graphrag.core.logging import get_logger
+from graphrag.core.redact import safe_detail
 from graphrag.jobs import JobStatus, JobStore
 from graphrag.pipelines import IngestPipeline
 
@@ -28,19 +29,24 @@ _REDIS_URL = Secrets().redis_url
 async def ingest_task(ctx: dict, job_id: str, path: str, user_id: str | None) -> None:
     container: Container = ctx["container"]
     store: JobStore = ctx["jobs"]
-    store.set(JobStatus(job_id, status="running"))
+    # `owner` on every write, including the failure path: the status endpoint
+    # matches on it, so an unowned job is not merely unprotected — it is
+    # invisible to the user who created it.
+    store.set(JobStatus(job_id, status="running", owner=user_id))
     try:
         # The pipeline is blocking (embeddings, Neo4j) — run it off the event loop.
         stats = await asyncio.to_thread(IngestPipeline(container).run, path, user_id)
         store.set(
             JobStatus(
                 job_id, status="done", documents=stats.documents, chunks=stats.chunks,
-                entities=stats.entities, relations=stats.relations,
+                entities=stats.entities, relations=stats.relations, owner=user_id,
             )
         )
     except Exception as exc:  # record failure; don't crash the worker
         log.warning("ingest_task_failed", job=job_id, error=str(exc))
-        store.set(JobStatus(job_id, status="error", detail=str(exc)))
+        store.set(
+            JobStatus(job_id, status="error", detail=safe_detail(exc), owner=user_id)
+        )
 
 
 async def startup(ctx: dict) -> None:

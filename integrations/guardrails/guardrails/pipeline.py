@@ -44,7 +44,12 @@ _UNKNOWN_CHECK = CheckConfig(flag_at=0.6, block_at=1.1)
 
 # ── Verdict cache ───────────────────────────────────────────────────────────
 class VerdictCache:
-    """LRU + TTL cache of successful judge verdicts (never caches failures)."""
+    """LRU + TTL cache of successful judge verdicts (never caches failures).
+
+    Values are ``(verdict, provider, model)``: the link that produced a verdict
+    is cached with it, so a hit reports the judge that actually decided rather
+    than whichever link happens to be primary when the hit is served.
+    """
 
     def __init__(self, *, max_size: int, ttl_seconds: int, enabled: bool = True) -> None:
         self._data: OrderedDict[str, tuple[float, Any]] = OrderedDict()
@@ -133,18 +138,24 @@ class GuardPipeline:
                                    _turns_repr(req.context, policy.judge.include_context_turns))
             cached = self._cache.get(key)
             if cached is not None:
-                judge_scores = cached.scores()
-                judge_info = self._judge_info(cached_flag=True)
+                verdict, c_prov, c_model = cached
+                judge_scores = verdict.scores()
+                judge_info = self._judge_info(cached_flag=True, provider=c_prov, model=c_model)
             else:
                 try:
                     outcome = await self._judge.evaluate_input(policy, judge_text, req.context)
                     verdict: InputVerdict = outcome.verdict  # type: ignore[assignment]
-                    self._cache.set(key, verdict)
+                    self._cache.set(key, (verdict, outcome.provider, outcome.model))
                     judge_scores = verdict.scores()
-                    judge_info = self._judge_info(latency_ms=outcome.latency_ms)
+                    judge_info = self._judge_info(
+                        latency_ms=outcome.latency_ms,
+                        provider=outcome.provider, model=outcome.model,
+                    )
                 except JudgeError as exc:
                     judge_failed = True
-                    judge_info = self._judge_info(error=exc.kind)
+                    judge_info = self._judge_info(
+                        error=exc.kind, provider=exc.provider, model=exc.model
+                    )
 
         return self._decide_input(
             policy, req.policy_id, rid, t0, checks,
@@ -208,22 +219,28 @@ class GuardPipeline:
                                    req.input[:2000], _docs_repr(req.context_docs))
             cached = self._cache.get(key)
             if cached is not None:
-                judge_scores = cached.scores()
-                unsupported = list(cached.unsupported_claims)
-                judge_info = self._judge_info(cached_flag=True)
+                verdict, c_prov, c_model = cached
+                judge_scores = verdict.scores()
+                unsupported = list(verdict.unsupported_claims)
+                judge_info = self._judge_info(cached_flag=True, provider=c_prov, model=c_model)
             else:
                 try:
                     outcome = await self._judge.evaluate_output(
                         policy, req.input, judge_text, req.context_docs
                     )
                     verdict: OutputVerdict = outcome.verdict  # type: ignore[assignment]
-                    self._cache.set(key, verdict)
+                    self._cache.set(key, (verdict, outcome.provider, outcome.model))
                     judge_scores = verdict.scores()
                     unsupported = list(verdict.unsupported_claims)
-                    judge_info = self._judge_info(latency_ms=outcome.latency_ms)
+                    judge_info = self._judge_info(
+                        latency_ms=outcome.latency_ms,
+                        provider=outcome.provider, model=outcome.model,
+                    )
                 except JudgeError as exc:
                     judge_failed = True
-                    judge_info = self._judge_info(error=exc.kind)
+                    judge_info = self._judge_info(
+                        error=exc.kind, provider=exc.provider, model=exc.model
+                    )
 
         grounded = GroundednessInfo(
             checked=has_docs and judge_info.invoked and not judge_failed and checks.ungrounded.enabled,
@@ -266,12 +283,16 @@ class GuardPipeline:
         return True
 
     def _judge_info(
-        self, *, cached_flag: bool = False, latency_ms: float | None = None, error: str | None = None
+        self, *, cached_flag: bool = False, latency_ms: float | None = None,
+        error: str | None = None, provider: str | None = None, model: str | None = None,
     ) -> JudgeInfo:
+        # `provider`/`model` name the chain link that actually served this
+        # verdict; without them a degraded chain reports its primary forever and
+        # a failover is invisible to whoever reads the response or the log.
         return JudgeInfo(
             invoked=True,
-            provider=self._judge.provider_name,
-            model=self._judge.model,
+            provider=provider or self._judge.provider_name,
+            model=model if provider else self._judge.model,
             cached=cached_flag,
             error=error,  # type: ignore[arg-type]
             latency_ms=latency_ms,

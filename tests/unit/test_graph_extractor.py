@@ -18,6 +18,8 @@ class _FakeLLM:
         self._payload = payload
 
     def invoke(self, messages):
+        if isinstance(self._payload, Exception):
+            raise self._payload
         body = self._payload if isinstance(self._payload, str) else json.dumps(self._payload)
         return SimpleNamespace(content=body)
 
@@ -40,7 +42,7 @@ def test_real_names_survive(name):
 
 
 def test_symbol_entities_are_dropped():
-    entities, _ = _extract(
+    result = _extract(
         {
             "entities": [
                 {"name": "Turing Machine", "type": "CONCEPT"},
@@ -51,12 +53,12 @@ def test_symbol_entities_are_dropped():
             "relations": [],
         }
     )
-    assert [e.name for e in entities] == ["Turing Machine"]
+    assert [e.name for e in result.entities] == ["Turing Machine"]
 
 
 def test_relations_to_dropped_entities_go_too():
     # A relation is only meaningful if both endpoints survived.
-    entities, relations = _extract(
+    result = _extract(
         {
             "entities": [
                 {"name": "Chomsky Normal Form", "type": "CONCEPT"},
@@ -73,20 +75,32 @@ def test_relations_to_dropped_entities_go_too():
             ],
         }
     )
-    assert len(entities) == 3  # "BC" has a letter -> the model's call, not ours
-    assert [r.type for r in relations] == ["PART_OF"]
+    assert len(result.entities) == 3  # "BC" has a letter -> the model's call, not ours
+    assert [r.type for r in result.relations] == ["PART_OF"]
 
 
 def test_names_are_stripped():
-    entities, _ = _extract({"entities": [{"name": "  Turing Machine \n", "type": "CONCEPT"}]})
-    assert entities[0].name == "Turing Machine"
+    result = _extract({"entities": [{"name": "  Turing Machine \n", "type": "CONCEPT"}]})
+    assert result.entities[0].name == "Turing Machine"
 
 
 def test_empty_extraction_is_fine():
-    entities, relations = _extract({"entities": [], "relations": []})
-    assert entities == [] and relations == []
+    result = _extract({"entities": [], "relations": []})
+    assert result.entities == [] and result.relations == []
+    assert result.failed is False
 
 
 def test_unparseable_reply_does_not_raise():
-    entities, relations = _extract("I cannot produce JSON for this.")
-    assert entities == [] and relations == []
+    result = _extract("I cannot produce JSON for this.")
+    assert result.entities == [] and result.relations == []
+    # The model answered, it just answered badly. That is a poor chunk, not a
+    # broken provider, so it must not be reported as an ingest failure.
+    assert result.failed is False
+
+
+def test_a_dead_provider_is_distinguishable_from_an_empty_chunk():
+    """Both give back no entities. Only one of them means the knowledge graph
+    is missing data the user should be told about."""
+    result = _extract(RuntimeError("403 PERMISSION_DENIED"))
+    assert result.entities == [] and result.relations == []
+    assert result.failed is True

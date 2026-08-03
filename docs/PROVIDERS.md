@@ -5,11 +5,65 @@ which config key selects them.
 
 | Role         | Config key            | Local default              | Cloud options                          |
 |--------------|-----------------------|----------------------------|----------------------------------------|
-| Reply LLM    | `llm.provider`        | `ollama` (gemma4)          | `anthropic` (claude-opus-4-8), `openai`, `gemini` |
+| Reply LLM    | `llm.provider`        | `ollama` (gemma4)          | `anthropic` (claude-opus-4-8), `openai`, `gemini`, `deepseek`, `qwen`, `deepinfra` |
 | Extraction   | `ingestion.llm`       | `ollama` (gemma4) — defaults to `llm` | any chat provider |
-| Embeddings   | `embeddings.provider` | `ollama` (bge-m3) or `sentence_transformers` (bge-m3) | `voyage`, `openai`, `gemini`, `cohere` |
+| Embeddings   | `embeddings.provider` | `ollama` (bge-m3) or `sentence_transformers` (bge-m3) | `voyage`, `openai`, `gemini`, `cohere`, `deepinfra` |
 | OCR          | `ocr.vision_llm.provider` | `ollama` (gemma3:4b)   | `gemini` (gemini-2.5-flash); or `tesseract` (offline) |
-| Reranker     | `retrieval.rerank.provider` | `ollama` (any chat model) or `cross_encoder` (bge-reranker) | `voyage`, `cohere`, `anthropic`, `openai`, `gemini` |
+| Reranker     | `retrieval.rerank.provider` | `ollama` (any chat model) or `cross_encoder` (bge-reranker) | `voyage`, `cohere`, `anthropic`, `openai`, `gemini`, `deepseek`, `qwen`, `deepinfra` |
+
+Any role can also be given a **failover chain** — see
+[Failover](#failover-one-dead-key-should-not-stop-the-service) below.
+
+## DeepInfra
+
+Serverless open-weight models (Llama, Qwen, DeepSeek, Mistral, BGE embeddings)
+behind one OpenAI-compatible endpoint, `https://api.deepinfra.com/v1/openai`.
+Set `DEEPINFRA_TOKEN` in `.env` — `DEEPINFRA_API_KEY` is accepted too, since
+that is what most people type first.
+
+```yaml
+llm:
+  provider: deepinfra
+  model: deepseek-ai/DeepSeek-V3
+
+embeddings:
+  provider: deepinfra
+  model: BAAI/bge-m3
+  dimensions: 1024
+
+retrieval:
+  rerank:
+    provider: deepinfra          # generative reranking, see the table below
+    model: Qwen/Qwen3-235B-A22B
+```
+
+**Model ids are the upstream ones, prefix and capitalisation included** —
+`deepseek-ai/DeepSeek-V3`, not `deepseek-v3`. A wrong case is a 404 on a model
+that exists. The catalogue changes as weights land and retire, so check
+[deepinfra.com/models](https://deepinfra.com/models) rather than trusting a list
+in a README.
+
+Two things make it a good fit for self-hosting this project:
+
+**It is the one cloud embedder you can safely fail over.** Embedding fallbacks
+are normally refused, because a different model puts text in a different vector
+space and silently corrupts retrieval (see below). DeepInfra serves models under
+their *upstream* ids, so `BAAI/bge-m3` there is the same weights as `BAAI/bge-m3`
+under `sentence_transformers` — same vectors, same space. That makes this legal,
+where a Cohere → Voyage fallback is not:
+
+```yaml
+embeddings:
+  provider: deepinfra
+  model: BAAI/bge-m3
+  fallbacks:
+    - { provider: sentence_transformers, model: BAAI/bge-m3 }
+```
+
+**Chunk sizing already agrees with it.** Chunks are measured in the embedding
+model's own tokens via an HF tokenizer, and `BAAI/bge-m3` is an HF repo id — so
+`embeddings.tokenizer` needs no override, unlike an Ollama tag such as
+`bge-m3:latest`.
 
 ## How swapping works
 
@@ -39,7 +93,7 @@ Rerankers come in three shapes, because Ollama serves no cross-encoder endpoint
 | Provider | How it scores | Cost at `candidate_k: 24` |
 |----------|---------------|---------------------------|
 | `cross_encoder` | local HF model, all pairs in one batched pass | ~0.2s, needs the `local-models` extra + a 2.2 GB model download |
-| `ollama` / `anthropic` / `openai` / `gemini` | a chat model rates each pair 0-10 | ~6s, no download |
+| `ollama` / `anthropic` / `openai` / `gemini` / `deepseek` / `qwen` / `deepinfra` | a chat model rates each pair 0-10 | ~6s, no download |
 | `cohere` / `voyage` | hosted rerank endpoint | network round-trip, API key |
 
 Generative reranking is pointwise — one call per candidate — so `candidate_k`
@@ -151,11 +205,89 @@ make up
 2. Put the relevant keys in `.env` (see `docs/CONFIGURATION.md`).
 3. `make up`
 
+## Failover: one dead key should not stop the service
+
+Any role that talks to an API takes a `fallbacks` list. A call that fails moves
+to the next entry, transparently to the agent:
+
+```yaml
+llm:
+  provider: deepseek
+  model: deepseek-v4-flash
+  fallbacks:
+    - { provider: deepinfra, model: deepseek-ai/DeepSeek-V3 }
+    - { provider: gemini,    model: gemini-3.5-flash }
+  failover_max_failures: 2         # consecutive failures before a provider is benched
+  failover_cooldown_seconds: 300   # how long it stays benched
+```
+
+A link whose API key is unset is dropped when the chain is built, so an unused
+provider costs nothing. Failovers log `llm_failover` and increment
+`graphrag_llm_failover_total{from_model,to_model,reason}`.
+
+Three behaviours worth knowing, because each one is a decision rather than an
+accident:
+
+- **A stream that has already emitted tokens does not fail over.** Restarting on
+  another provider would print the answer to the user twice, so once any token
+  is out the error propagates instead.
+- **A dead provider gets benched.** A revoked key fails in ~200 ms *per call*;
+  without a circuit breaker that is a permanent latency tax. After
+  `failover_max_failures` in a row a provider is skipped for the cooldown, then
+  probed again — so one that comes back starts serving with no redeploy.
+- **Request-shaped errors do not fail over.** A prompt over the context limit,
+  or one a safety filter refused, fails identically on the next provider.
+  Retrying only spends a second call to reach the same error.
+
+### Embeddings are the exception
+
+`embeddings.fallbacks` may only name **the same model** as the primary, and
+config raises at load time otherwise. This is not caution for its own sake: two
+embedding models place the same text at different points in vector space, so a
+silent switch writes vectors that cannot be compared with the ones already
+stored. Ingest would poison the index and queries would return nonsense
+neighbours, with nothing raised anywhere — the worst kind of failure, one that
+looks like it worked. If your embedder is down, ingest should fail and be
+retried.
+
+What *is* allowed is a second route to the same weights — see the DeepInfra
+example above.
+
+### The reranker decides whether questions get answered
+
+`retrieval.min_relevance` refuses any question whose best chunk scores below it,
+on the reranker's 0–1 scale. So a dead reranker is not merely worse ordering. If
+every link in the rerank chain fails, scores fall back to raw retrieval
+similarities on a different scale, and the gate **suspends itself** (logged as
+`relevance_gate_bypassed`) rather than compare against numbers that do not mean
+what it expects. Answering with citations beats refusing everything.
+
+## Checking what actually works
+
+A revoked or billing-blocked key still constructs a perfectly good client, so
+nothing looks wrong until a user's question 500s. `scripts/preflight.py` makes
+one real call per provider:
+
+```bash
+python scripts/preflight.py            # everything
+python scripts/preflight.py --quick    # skip the paid calls
+docker compose exec -T api python scripts/preflight.py
+```
+
+It exits non-zero only when a role has *no* working provider, so a chain running
+on its second link reports `WARN` and still passes.
+
 ## Adding a new provider
 
-- **LLM:** add a branch in `llm/factory.py`.
+- **LLM:** add a branch in `llm/factory.py`. If it is OpenAI-compatible — as
+  DeepSeek, Qwen and DeepInfra all are — that is a `ChatOpenAI` with a
+  `base_url`, plus the key in `Secrets` and an entry in `_CREDENTIAL` so
+  failover can tell a configured provider from an unconfigured one.
 - **Embeddings:** add a branch in `embeddings/api_providers.py` (or a new class
-  implementing `Embedder`).
+  implementing `Embedder`). Add its output size to `_KNOWN_DIMS` — the vector
+  store is created with that number, so a wrong guess costs a re-ingest.
+- **Reranker:** add the name to `_LLM_PROVIDERS` in `retrieval/reranker.py` to
+  use it generatively.
 - **Store:** implement `GraphStore` / `VectorStore` and register it in
   `storage/__init__.py`.
 

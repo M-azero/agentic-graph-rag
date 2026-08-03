@@ -1,6 +1,7 @@
 """FastAPI application + entrypoint.
 
-Wires Settings -> PolicyRegistry -> Provider -> Judge -> Pipeline at startup and exposes:
+Wires Settings -> PolicyRegistry -> Provider chain -> Judge -> Pipeline at startup and
+exposes:
 
     POST /v1/guard/input     POST /v1/guard/output
     GET  /health             GET  /v1/policies      GET /v1/policies/{id}
@@ -25,7 +26,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from . import __version__
 from .config import Settings, get_settings
 from .judge.judge import Judge
-from .judge.providers import build_provider
+from .judge.providers import build_provider_chain
 from .pipeline import GuardPipeline
 from .policy import PolicyRegistry
 from .schemas import (
@@ -46,16 +47,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         registry = PolicyRegistry.load_dir(settings.policy_dir, settings.default_policy)
-        provider = build_provider(settings)
-        judge = Judge(provider, settings)
+        providers, skipped = build_provider_chain(settings)
+        judge = Judge(providers, settings)
         app.state.settings = settings
         app.state.registry = registry
         app.state.judge = judge
         app.state.pipeline = GuardPipeline(settings, registry, judge)
         logger.info(
-            json.dumps({"event": "startup", "provider": provider.name,
-                        "model": provider.model, "policies": registry.ids()})
+            json.dumps({"event": "startup", "provider": judge.provider_name,
+                        "model": judge.model, "chain": judge.chain,
+                        "policies": registry.ids()})
         )
+        # Loud, because a silently dropped link is the difference between a
+        # chain and a single provider — and the guard fails open, so the first
+        # you would otherwise hear of it is nothing being screened.
+        if skipped:
+            logger.warning(json.dumps({"event": "judge_links_skipped", "links": skipped}))
+        if len(providers) == 1 and settings.llm_fallbacks.strip():
+            logger.warning(json.dumps({
+                "event": "judge_chain_empty",
+                "detail": "GUARD_LLM_FALLBACKS is set but no link survived; "
+                          "the judge is a single point of failure",
+            }))
         yield
 
     # Hide the interactive docs (/docs, /redoc, /openapi.json) unless explicitly enabled,
@@ -88,7 +101,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         registry: PolicyRegistry = request.app.state.registry
         return HealthResponse(
             status="ok", version=__version__, provider=judge.provider_name,
-            model=judge.model, policies=registry.ids(),
+            model=judge.model, chain=judge.chain, policies=registry.ids(),
         )
 
     # ── Guard endpoints ──────────────────────────────────────────────────────
@@ -141,7 +154,8 @@ def _log_verdict(settings: Settings, direction: str, text: str, resp: Any) -> No
         "action": resp.action,
         "categories": [c.category for c in resp.categories],
         "judge": {"invoked": resp.judge.invoked, "cached": resp.judge.cached,
-                  "error": resp.judge.error, "provider": resp.judge.provider},
+                  "error": resp.judge.error, "provider": resp.judge.provider,
+                  "model": resp.judge.model},
         "latency_ms": resp.latency_ms,
         "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest()[:16],
     }

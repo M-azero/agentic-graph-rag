@@ -38,23 +38,30 @@ ingest: ## Ingest a file or folder: make ingest FILE=./data/mydoc.pdf
 admin: ## Grant an account the admin role: make admin EMAIL=you@example.com
 	$(COMPOSE) exec api graphrag promote-admin $(EMAIL)
 
+# The break-glass for a lockout the admin console cannot fix — because the
+# locked-out account is the only admin, so nobody is left who can sign in.
+unlock: ## Clear a login lockout: make unlock EMAIL=you@example.com
+	$(COMPOSE) exec api graphrag unlock $(EMAIL)
+
 up: ## One command: bring up the whole stack, then apply migrations
 	$(COMPOSE) up -d --build
 	$(COMPOSE) exec -T api alembic upgrade head
+	@echo "App:      http://localhost         (admin console: http://localhost/admin)"
 	@echo "API:      http://localhost:8000  (docs: http://localhost:8000/docs)"
-	@echo "Frontend: http://localhost:5173"
 	@echo "Neo4j:    http://localhost:7474"
 
 up-features: ## RAG + Guardrails safety, one stack (no llmlens)
 	$(COMPOSE) $(FEATURES) up -d --build
 	$(COMPOSE) $(FEATURES) exec -T api alembic upgrade head
-	@echo "API:        http://localhost:8000/docs   Frontend: http://localhost:5173"
+	@echo "App:        http://localhost   Admin: http://localhost/admin"
+	@echo "API:        http://localhost:8000/docs"
 	@echo "Guardrails: http://localhost:8080/health"
 
 deploy: ## Everything in ONE command: RAG + Guardrails + llmlens observability
 	$(COMPOSE) $(FEATURES) --profile observability up -d --build
 	$(COMPOSE) $(FEATURES) exec -T api alembic upgrade head
-	@echo "API:        http://localhost:8000/docs   Frontend: http://localhost:5173"
+	@echo "App:        http://localhost   Admin: http://localhost/admin"
+	@echo "API:        http://localhost:8000/docs"
 	@echo "Guardrails: http://localhost:8080/health  (verdict service)"
 	@echo "llmlens UI: http://localhost:5273         (traces / cost / alerts)"
 	@echo "NOTE: enable the features in configs/$(PROFILE).yaml — safety.enabled / observability.enabled"
@@ -82,8 +89,16 @@ test-all: ## Run every test (needs Postgres + Neo4j + Redis up)
 eval: ## Score retrieval + answers against the golden set (needs the stack up)
 	GRAPHRAG_PROFILE=$(PROFILE) python scripts/eval.py
 
-frontend: ## Build the web UI (type-checks it too)
+web: ## Build both web apps (type-checks them too)
 	cd frontend && npm ci && npm run build
+	cd admin && npm ci && npm run build
+
+frontend: web   ## Deprecated alias for `web`
+
+# The Caddyfile is the only way into the deployment. Check it before you ship
+# it, not after the container refuses to start.
+proxy-check: ## Validate docker/Caddyfile without deploying it
+	docker run --rm -v "$(CURDIR)/docker/Caddyfile:/etc/caddy/Caddyfile:ro" 	  -e SITE_ADDRESS=:80 -e TLS_EMAIL= -e MAX_UPLOAD_MB=25 	  caddy:2-alpine caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
 
 lint: ## Lint & type-check
 	ruff check src tests migrations

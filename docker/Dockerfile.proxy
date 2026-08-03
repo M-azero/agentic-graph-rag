@@ -1,0 +1,45 @@
+# The public entrypoint: TLS, static hosting for both web apps, and the API
+# reverse proxy — one container where there used to be two.
+#
+# Build context is the repo root, because this image needs `frontend/` and
+# `admin/`, which have no common parent below it. See the root .dockerignore.
+#
+# The two node stages are independent, so BuildKit runs them in parallel.
+
+# --- the chat app ------------------------------------------------------------
+FROM node:20-alpine AS chat
+WORKDIR /app
+# Lockfile first, and `npm ci` rather than `npm install`: ci installs exactly
+# what the lockfile pins, so the image ships the tree that CI tested. With only
+# package.json, npm re-resolves every caret range at build time.
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
+COPY frontend/ ./
+RUN npm run build
+
+# --- the admin console -------------------------------------------------------
+FROM node:20-alpine AS console
+WORKDIR /app
+COPY admin/package.json admin/package-lock.json ./
+RUN npm ci
+COPY admin/ ./
+RUN npm run build
+
+# --- the proxy ---------------------------------------------------------------
+FROM caddy:2-alpine
+
+# Baked so `docker run` on this image works on its own. Compose also bind-mounts
+# the same file read-only, which is what makes a config fix a
+# `docker compose restart proxy` instead of a rebuild — worth having when the
+# thing you are fixing is the only way into the deployment.
+COPY docker/Caddyfile /etc/caddy/Caddyfile
+
+COPY --from=chat    /app/dist /srv/app
+COPY --from=console /app/dist /srv/admin
+
+# Bodies larger than this are refused here, before they reach the API. Keep it
+# >= api.max_upload_mb in configs/*.yaml, or an upload dies as a bare 413
+# without the API's own explanation. Overridden from .env via compose.
+ENV MAX_UPLOAD_MB=25
+
+EXPOSE 80 443

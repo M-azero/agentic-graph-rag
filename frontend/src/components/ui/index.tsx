@@ -15,16 +15,18 @@ import {
 type Variant = "primary" | "secondary" | "ghost" | "danger";
 type Size = "sm" | "md";
 
+// Borders rather than rings throughout. A ring is drawn outside the box, so a
+// row of ringed controls sits on a halo of doubled lines; a border is part of
+// the box and lines up with the hairlines everywhere else.
 const VARIANTS: Record<Variant, string> = {
-  primary: "bg-accent text-accent-text hover:opacity-90 active:opacity-100 shadow-card",
-  secondary:
-    "bg-surface text-body ring-1 ring-inset ring-border hover:bg-raised active:bg-raised",
+  primary: "bg-accent text-accent-text hover:opacity-90 active:opacity-100",
+  secondary: "bg-surface text-body border border-border hover:bg-raised active:bg-raised",
   ghost: "text-muted hover:bg-raised hover:text-body",
   danger: "bg-danger text-white hover:opacity-90",
 };
 
 const SIZES: Record<Size, string> = {
-  sm: "h-8 px-2.5 text-[13px] gap-1.5",
+  sm: "h-8 px-2.5 text-sm gap-1.5",
   md: "h-9 px-3.5 text-sm gap-2",
 };
 
@@ -70,8 +72,8 @@ export function Spinner({ className }: { className?: string }) {
 }
 
 const FIELD =
-  "w-full rounded-md bg-surface px-3 text-sm text-strong ring-1 ring-inset ring-border " +
-  "placeholder:text-muted transition-shadow focus:ring-2 focus:ring-accent " +
+  "w-full rounded-md border border-border bg-surface px-3 text-sm text-strong " +
+  "placeholder:text-muted transition-colors focus:border-accent focus:outline-none " +
   "disabled:opacity-60";
 
 export const Input = forwardRef<HTMLInputElement, InputHTMLAttributes<HTMLInputElement>>(
@@ -95,7 +97,7 @@ export const Select = forwardRef<HTMLSelectElement, SelectHTMLAttributes<HTMLSel
 
 export function Label({ children, htmlFor }: { children: ReactNode; htmlFor?: string }) {
   return (
-    <label htmlFor={htmlFor} className="mb-1.5 block text-[13px] font-medium text-body">
+    <label htmlFor={htmlFor} className="mb-1.5 block text-sm font-medium text-body">
       {children}
     </label>
   );
@@ -117,9 +119,9 @@ export function Field({
       <Label>{label}</Label>
       {children}
       {error ? (
-        <p className="mt-1.5 text-[13px] text-danger">{error}</p>
+        <p className="mt-1.5 text-sm text-danger">{error}</p>
       ) : hint ? (
-        <p className="mt-1.5 text-[13px] text-muted">{hint}</p>
+        <p className="mt-1.5 text-sm text-muted">{hint}</p>
       ) : null}
     </div>
   );
@@ -137,7 +139,7 @@ export function Card({
   return (
     <div
       className={clsx(
-        "rounded-xl bg-surface ring-1 ring-border",
+        "rounded-xl border border-border bg-surface",
         padded && "p-5",
         className,
       )}
@@ -170,7 +172,7 @@ export function Badge({ children, tone = "neutral" }: { children: ReactNode; ton
   return (
     <span
       className={clsx(
-        "inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium",
+        "inline-flex items-center rounded-full px-2 py-0.5 text-2xs font-medium",
         TONES[tone],
       )}
     >
@@ -194,7 +196,7 @@ export function EmptyState({
     <div className="flex flex-col items-center justify-center px-6 py-14 text-center">
       {icon && <div className="mb-3 text-muted">{icon}</div>}
       <p className="text-sm font-medium text-strong">{title}</p>
-      {description && <p className="mt-1 max-w-sm text-[13px] text-muted">{description}</p>}
+      {description && <p className="mt-1 max-w-sm text-sm text-muted">{description}</p>}
       {action && <div className="mt-4">{action}</div>}
     </div>
   );
@@ -217,15 +219,12 @@ export function Alert({
   children: ReactNode;
 }) {
   const tones = {
-    danger: "bg-danger/10 text-danger ring-danger/20",
-    caution: "bg-caution/10 text-caution ring-caution/20",
-    positive: "bg-positive/10 text-positive ring-positive/20",
+    danger: "bg-danger/10 text-danger border-danger/20",
+    caution: "bg-caution/10 text-caution border-caution/20",
+    positive: "bg-positive/10 text-positive border-positive/20",
   };
   return (
-    <div
-      role="alert"
-      className={clsx("rounded-md px-3 py-2 text-[13px] ring-1 ring-inset", tones[tone])}
-    >
+    <div role="alert" className={clsx("rounded-md border px-3 py-2 text-sm", tones[tone])}>
       {children}
     </div>
   );
@@ -249,8 +248,8 @@ export function Meter({
   return (
     <div>
       <div className="mb-1.5 flex items-baseline justify-between gap-2">
-        <span className="text-[13px] text-body">{label}</span>
-        <span className="font-mono text-[12px] text-muted">
+        <span className="text-sm text-body">{label}</span>
+        <span className="font-mono text-xs text-muted">
           {used.toLocaleString()}
           {unit} / {max.toLocaleString()}
           {unit}
@@ -287,7 +286,7 @@ export function Modal({
         role="dialog"
         aria-modal
         aria-label={title}
-        className="w-full max-w-md rounded-xl bg-surface p-5 shadow-pop ring-1 ring-border animate-slide-up"
+        className="w-full max-w-md rounded-xl bg-surface p-5 border border-border shadow-pop animate-slide-up"
         onClick={(e) => e.stopPropagation()}
       >
         <h2 className="mb-4 text-sm font-semibold text-strong">{title}</h2>

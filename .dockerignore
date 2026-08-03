@@ -1,7 +1,15 @@
-# Build context for docker/Dockerfile (the API image). The image only needs
-# pyproject.toml, README.md, alembic.ini, src/, configs/, migrations/,
-# docker/entrypoint.sh and integrations/llmlens/sdk — everything below is
-# either huge (.venv, .git, node_modules), host-specific, or secret.
+# Shared build context for the two images built from the repo root:
+#
+#   docker/Dockerfile        the API — needs pyproject.toml, README.md,
+#                            alembic.ini, src/, configs/, migrations/,
+#                            docker/entrypoint.sh, integrations/llmlens/sdk
+#   docker/Dockerfile.proxy  the proxy — needs frontend/ and admin/, which have
+#                            no common parent below the repo root
+#
+# Everything excluded below is huge (.venv, .git, node_modules), host-specific,
+# or secret. The API image never COPYs frontend/ or admin/, so carrying their
+# sources in the context costs a few hundred KB of transfer and nothing in the
+# resulting image.
 .git
 .venv
 .env
@@ -11,7 +19,17 @@ data
 docs
 tests
 scripts
-frontend
+# ...except the preflight check, which is an operational tool: it has to run
+# against the deployed config, inside the container, on the real network.
+# Running it from a laptop would test the laptop's view of the world.
+!scripts/preflight.py
+# The web apps' *sources* are needed by Dockerfile.proxy; their installed trees
+# and build output are not — `npm ci` recreates node_modules inside the build,
+# and a host-built dist would be copied over anyway.
+frontend/node_modules
+frontend/dist
+admin/node_modules
+admin/dist
 .pytest_cache
 .mypy_cache
 # The integrations have their own build contexts (compose points straight at

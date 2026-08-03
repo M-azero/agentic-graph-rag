@@ -17,24 +17,45 @@ from graphrag.core.errors import ConfigError, ProviderError
 from graphrag.core.logging import get_logger
 from graphrag.core.messages import content_to_text
 from graphrag.core.types import RetrievedChunk
-from graphrag.llm.factory import build_chat_model
+from graphrag.llm.factory import build_chat_chain
 
 log = get_logger(__name__)
 
 _SCORE_RE = re.compile(r"\d+(?:\.\d+)?")
 # Chat providers that can be driven as a generative reranker.
-_LLM_PROVIDERS = ("ollama", "anthropic", "openai", "gemini")
+_LLM_PROVIDERS = (
+    "ollama", "anthropic", "openai", "gemini", "deepseek", "qwen", "deepinfra",
+)
+
+# Stamped on every returned chunk. False means the scores are raw retrieval
+# similarities rather than calibrated relevance, which `retrieval.min_relevance`
+# must not be compared against — see `graphrag.api.routers.query`.
+CALIBRATED = "rerank_calibrated"
+
+
+def _mark(chunks: list[RetrievedChunk], calibrated: bool) -> list[RetrievedChunk]:
+    for chunk in chunks:
+        chunk.metadata[CALIBRATED] = calibrated
+    return chunks
 
 
 class Reranker(abc.ABC):
+    # True when `rerank` returns scores on the 0-1 relevance scale the
+    # closed-domain gate is calibrated against.
+    calibrated: bool = True
+
     @abc.abstractmethod
     def rerank(self, query: str, chunks: list[RetrievedChunk], top_k: int) -> list[RetrievedChunk]:
         ...
 
 
 class NoOpReranker(Reranker):
+    # Passes retrieval scores straight through. Those are cosine/RRF values on
+    # their own scale, not relevance.
+    calibrated = False
+
     def rerank(self, query, chunks, top_k):
-        return chunks[:top_k]
+        return _mark(chunks[:top_k], False)
 
 
 class CrossEncoderReranker(Reranker):
@@ -54,13 +75,13 @@ class CrossEncoderReranker(Reranker):
             return []
         scores = self._model.predict([(query, c.text) for c in chunks])
         ranked = sorted(zip(chunks, scores, strict=True), key=lambda cs: cs[1], reverse=True)
-        return [
+        return _mark([
             RetrievedChunk(
                 chunk_id=c.chunk_id, text=c.text, source=c.source,
                 score=float(s), retriever=c.retriever, metadata=c.metadata,
             )
             for c, s in ranked[:top_k]
-        ]
+        ], True)
 
 
 class LLMReranker(Reranker):
@@ -84,8 +105,9 @@ class LLMReranker(Reranker):
             # latency for a scoring prompt (~8x measured), so off by default.
             extra.setdefault("reasoning", False)
         self.cfg = cfg
-        self._llm = build_chat_model(
+        self._llm = build_chat_chain(
             cfg.provider, cfg.model, secrets,
+            fallbacks=[f for f in cfg.fallbacks if f.provider in _LLM_PROVIDERS],
             temperature=0.0, max_tokens=cfg.max_tokens, extra=extra,
         )
 
@@ -117,13 +139,15 @@ class LLMReranker(Reranker):
         unscored = [(c, c.score) for c, s in pairs if s is None]
         if unscored:
             log.warning("rerank_partial", scored=len(ranked), unscored=len(unscored))
-        return [
+        # Nothing scored at all means every call failed: the "scores" below are
+        # raw retrieval values, so the gate must not read them as relevance.
+        return _mark([
             RetrievedChunk(
                 chunk_id=c.chunk_id, text=c.text, source=c.source,
                 score=float(s), retriever=c.retriever, metadata=c.metadata,
             )
             for c, s in (ranked + unscored)[:top_k]
-        ]
+        ], bool(ranked))
 
 
 class APIReranker(Reranker):
@@ -161,22 +185,84 @@ class APIReranker(Reranker):
         except ImportError as exc:  # pragma: no cover
             raise ProviderError(f"Rerank provider '{self._provider}' package missing") from exc
 
-        return [
+        return _mark([
             RetrievedChunk(
                 chunk_id=chunks[i].chunk_id, text=chunks[i].text, source=chunks[i].source,
                 score=float(score), retriever=chunks[i].retriever, metadata=chunks[i].metadata,
             )
             for i, score in order
-        ]
+        ], True)
+
+
+class FallbackReranker(Reranker):
+    """Try each reranker in turn; the first that answers wins.
+
+    Reranking is not optional here the way it looks: `retrieval.min_relevance`
+    refuses any question whose top score falls below it, so losing the reranker
+    does not merely worsen ordering — it decides whether questions get answered
+    at all. Hence a chain, and hence the last resort being a no-op that reports
+    itself as uncalibrated rather than one that quietly hands the gate a
+    different scale.
+    """
+
+    def __init__(self, members: list[Reranker], labels: list[str]) -> None:
+        self._members = members
+        self._labels = labels
+
+    @property
+    def calibrated(self) -> bool:
+        return any(m.calibrated for m in self._members)
+
+    def rerank(self, query, chunks, top_k):
+        if not chunks:
+            return []
+        for index, member in enumerate(self._members):
+            try:
+                return member.rerank(query, chunks, top_k)
+            except Exception as exc:
+                nxt = self._labels[index + 1] if index + 1 < len(self._labels) else "none"
+                log.warning(
+                    "rerank_failover", failed=self._labels[index], next=nxt, error=str(exc)
+                )
+        log.warning("rerank_unavailable", note="retrieval order only; relevance gate bypassed")
+        return _mark(chunks[:top_k], False)
+
+
+def _build_one(provider: str, model: str, cfg: RerankCfg, secrets: Secrets) -> Reranker:
+    if provider == "cross_encoder":
+        return CrossEncoderReranker(model)
+    if provider in ("cohere", "voyage"):
+        return APIReranker(provider, model, secrets)
+    if provider in _LLM_PROVIDERS:
+        return LLMReranker(cfg.model_copy(update={"provider": provider, "model": model}), secrets)
+    raise ConfigError(f"Unknown rerank provider: {provider}")
 
 
 def build_reranker(cfg: RerankCfg, secrets: Secrets) -> Reranker:
     if not cfg.enabled or cfg.provider == "none":
         return NoOpReranker()
-    if cfg.provider == "cross_encoder":
-        return CrossEncoderReranker(cfg.model)
-    if cfg.provider in ("cohere", "voyage"):
-        return APIReranker(cfg.provider, cfg.model, secrets)
-    if cfg.provider in _LLM_PROVIDERS:
-        return LLMReranker(cfg, secrets)
-    raise ConfigError(f"Unknown rerank provider: {cfg.provider}")
+
+    primary = _build_one(cfg.provider, cfg.model, cfg, secrets)
+    if not cfg.fallbacks:
+        return primary
+
+    members = [primary]
+    labels = [f"{cfg.provider}:{cfg.model}"]
+    for fb in cfg.fallbacks:
+        label = f"{fb.provider}:{fb.model}"
+        if (fb.provider, fb.model) == (cfg.provider, cfg.model):
+            continue
+        try:
+            members.append(_build_one(fb.provider, fb.model, cfg, secrets))
+        except Exception as exc:
+            # Building a reranker can fail for good reasons — cross_encoder
+            # without the local-models extra, a provider whose package is
+            # absent. Drop the link, keep the deployment.
+            log.warning("rerank_fallback_skipped", model=label, reason=str(exc))
+            continue
+        labels.append(label)
+
+    if len(members) == 1:
+        return primary
+    log.info("rerank_chain_ready", chain=" -> ".join(labels))
+    return FallbackReranker(members, labels)

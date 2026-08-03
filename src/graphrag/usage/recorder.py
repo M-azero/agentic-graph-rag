@@ -13,18 +13,32 @@ from __future__ import annotations
 
 import contextlib
 import uuid
+from typing import TYPE_CHECKING
 
 from graphrag.core.logging import get_logger
 from graphrag.db.engine import session_scope
 from graphrag.db.models import UsageEvent
-from graphrag.limits.service import LimitService
+
+if TYPE_CHECKING:
+    # Type-only: importing this at runtime pulls in graphrag.limits.__init__,
+    # which imports the FastAPI deps, which import the app — and the query
+    # pipeline now imports this module, closing the loop.
+    from graphrag.limits.service import LimitService
 
 log = get_logger(__name__)
 
 MESSAGE = "message"
+TOKENS_IN = "tokens_in"
 TOKENS_OUT = "tokens_out"
 UPLOAD = "upload"
 INGEST_CHUNKS = "ingest_chunks"
+
+# Kinds that count against the token quota. Both sides cost money, and in RAG
+# the prompt is the bigger half — every agent turn resends the system prompt,
+# the conversation and the retrieved chunks. Recorded as separate events so the
+# admin charts can still tell them apart (they are priced differently, often by
+# 4-5x), but summed into one ceiling so a quota means "spend", not "half of it".
+_BILLABLE = (TOKENS_IN, TOKENS_OUT)
 
 
 class UsageRecorder:
@@ -37,7 +51,7 @@ class UsageRecorder:
     ) -> None:
         if amount <= 0:
             return
-        if self._limits is not None and kind == TOKENS_OUT:
+        if self._limits is not None and kind in _BILLABLE:
             self._limits.record_tokens(user_id, amount)
 
         if self._factory is None:
@@ -66,3 +80,60 @@ def record_usage(redis_client, user_id: str | None, tokens: int) -> None:
         return
     with contextlib.suppress(Exception):
         redis_client.hincrby("graphrag:usage:tokens", user_id or "default", tokens)
+
+
+def estimate_tokens(text: str) -> int:
+    """Approximate output tokens for an answer that wasn't streamed.
+
+    The streaming path counts real chunks, one per `token` event. A
+    non-streamed answer arrives whole, with no per-token signal and no usage
+    metadata on `QueryResult`, so it has to be estimated from the text — and
+    *some* estimate is the point: an uncounted answer costs the caller nothing,
+    which turns `stream: false` into an unmetered path.
+
+    Two buckets, because one ratio is wrong for half the world: ~4 characters
+    per token holds for ASCII, while Arabic, Hebrew and CJK pack closer to 2.
+    Charging those scripts at the ASCII rate would hand them roughly double the
+    real budget. Deliberately a heuristic — quotas are a spend ceiling, not an
+    invoice, and both paths only ever need to be comparable to each other.
+    """
+    if not text:
+        return 0
+    ascii_chars = sum(1 for c in text if c.isascii())
+    wide_chars = len(text) - ascii_chars
+    return max(1, round(ascii_chars / 4 + wide_chars / 2))
+
+
+async def record_answer_tokens(
+    recorder: UsageRecorder | None,
+    redis_client,
+    *,
+    tenant_id: str | None,
+    account_id: str | None,
+    tokens: int,
+    input_tokens: int = 0,
+    meta: dict | None = None,
+) -> None:
+    """The one way to book a run's tokens, from every path that produces an answer.
+
+    `tokens` is the completion side, `input_tokens` the prompt side. They are
+    stored as separate events — prompt and completion are priced differently,
+    often by 4-5x, so an admin chart that merged them could not explain a bill —
+    and summed into the single quota counter, so the ceiling bounds real spend
+    rather than the cheaper half of it.
+
+    Both destinations belong together: the Redis counter is what `check_tokens`
+    reads to enforce, and the `usage_events` row is the durable record. A path
+    that does one and not the other either enforces without a record or records
+    without enforcing — the second is how `stream: false` spent tokens for free.
+    """
+    total = max(0, tokens) + max(0, input_tokens)
+    if total <= 0:
+        return
+    record_usage(redis_client, tenant_id, total)
+    if recorder is None or not account_id:
+        return
+    if input_tokens > 0:
+        await recorder.record(account_id, TOKENS_IN, input_tokens, meta or {})
+    if tokens > 0:
+        await recorder.record(account_id, TOKENS_OUT, tokens, meta or {})

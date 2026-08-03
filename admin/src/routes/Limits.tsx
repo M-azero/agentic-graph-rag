@@ -1,8 +1,8 @@
 import { useEffect, useState } from "react";
 
-import { admin } from "../../api";
-import { LimitsForm } from "../../components/admin/LimitsForm";
-import { Alert, Button, Card, CardTitle, Modal, Skeleton } from "../../components/ui";
+import { admin } from "../api";
+import { LimitsForm } from "../components/LimitsForm";
+import { Alert, Button, Card, Modal, Skeleton } from "../components/ui";
 
 export default function Limits() {
   const [globals, setGlobals] = useState<Record<string, number> | null>(null);
@@ -39,15 +39,16 @@ export default function Limits() {
   }
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-5">
       {error && <Alert>{error}</Alert>}
       {notice && <Alert tone="positive">{notice}</Alert>}
 
-      <Card>
-        <CardTitle>Default limits</CardTitle>
-        <p className="mb-4 text-[13px] text-muted">
-          What every user gets unless they have an override. Changing these
-          applies immediately, including to existing accounts.
+      <Card title="Default limits">
+        <p className="mb-4 text-xs text-muted">
+          What every user gets unless they have an override. Changes apply immediately,
+          including to existing accounts. Token ceilings count prompt and completion
+          together — budget roughly 10k per question, not the few hundred the visible
+          answer suggests.
         </p>
         {!globals ? (
           <Skeleton className="h-40 w-full" />
@@ -66,39 +67,36 @@ export default function Limits() {
         )}
       </Card>
 
-      <Card>
-        <CardTitle>Apply to everyone</CardTitle>
-        <p className="mb-4 text-[13px] text-muted">
-          Clearing every override puts all users back on the defaults above.
-          Individual limits set on a user's page are discarded.
+      <Card title="Apply to everyone">
+        <p className="mb-4 text-xs text-muted">
+          Clearing every override puts all users back on the defaults above. Individual
+          limits set on a user's page are discarded.
         </p>
         <Button variant="danger" onClick={() => setConfirmClear(true)}>
           Clear all per-user overrides
         </Button>
       </Card>
 
-      <Modal
-        open={confirmClear}
-        title="Clear every override?"
-        onClose={() => setConfirmClear(false)}
-      >
-        <p className="text-[13px] text-muted">
-          Every user returns to the default limits. Any custom allowance you've
-          granted is removed.
-        </p>
-        <div className="mt-4 flex justify-end gap-2">
-          <Button onClick={() => setConfirmClear(false)}>Cancel</Button>
-          <Button
-            variant="danger"
-            onClick={async () => {
-              setConfirmClear(false);
-              await run(() => admin.bulkLimits({ clear: true }), "All overrides cleared.");
-            }}
-          >
-            Clear overrides
-          </Button>
-        </div>
-      </Modal>
+      {confirmClear && (
+        <Modal title="Clear every override?" onClose={() => setConfirmClear(false)}>
+          <p className="text-sm text-muted">
+            Every user returns to the default limits. Any custom allowance you have granted
+            is removed.
+          </p>
+          <div className="mt-4 flex justify-end gap-2">
+            <Button onClick={() => setConfirmClear(false)}>Cancel</Button>
+            <Button
+              variant="danger"
+              onClick={async () => {
+                setConfirmClear(false);
+                await run(() => admin.bulkLimits({ clear: true }), "All overrides cleared.");
+              }}
+            >
+              Clear overrides
+            </Button>
+          </div>
+        </Modal>
+      )}
     </div>
   );
 }

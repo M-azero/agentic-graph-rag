@@ -18,10 +18,12 @@ from datetime import UTC, datetime, timedelta
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy import delete, func, select
 
+from graphrag.accounts import AccountError
 from graphrag.api.deps import AuthUser, get_container, get_db, require_admin_user
 from graphrag.api.schemas import (
     Acknowledged,
     AdminUser,
+    AdminUserCreate,
     AdminUserDetail,
     AdminUserList,
     BulkLimits,
@@ -89,6 +91,9 @@ async def _audit(
 
 
 def _shape_user(user: User, **counts) -> AdminUser:
+    # `locked_until` is reported as-is rather than as a boolean: an admin
+    # deciding whether to unlock someone needs to know it clears in 60 seconds
+    # versus an hour.
     return AdminUser(
         id=str(user.id),
         email=user.email,
@@ -98,6 +103,11 @@ def _shape_user(user: User, **counts) -> AdminUser:
         created_at=user.created_at.isoformat() if user.created_at else "",
         last_login_at=user.last_login_at.isoformat() if user.last_login_at else None,
         email_verified=user.email_verified_at is not None,
+        locked_until=user.locked_until.isoformat() if user.locked_until else None,
+        failed_logins=user.failed_logins or 0,
+        password_changed_at=(
+            user.password_changed_at.isoformat() if user.password_changed_at else None
+        ),
         **counts,
     )
 
@@ -267,6 +277,82 @@ def _graph_stats(container: Container, tenant_id: str) -> dict[str, int]:
     except Exception as exc:
         log.warning("graph_stats_unavailable", tenant=tenant_id, error=str(exc))
         return {}
+
+
+@router.post("/users", response_model=AdminUser, status_code=201)
+async def create_user(
+    payload: AdminUserCreate,
+    request: Request,
+    admin: AuthUser | None = Depends(require_admin_user),
+    db=Depends(get_db),
+) -> AdminUser:
+    """Invite an account into existence.
+
+    This is what makes `open_registration: false` a usable configuration
+    rather than a dead end — without it, closing registration closes onboarding
+    too. No password crosses this boundary: the invitee sets their own via the
+    emailed code, through the same reset flow everyone else uses.
+    """
+    accounts = request.app.state.accounts
+    if accounts is None:
+        raise HTTPException(status_code=503, detail="The admin panel needs a database.")
+    try:
+        user = await accounts.admin_create_user(payload.email, payload.role)
+    except AccountError as exc:
+        status = 409 if exc.code == "already_exists" else 400
+        raise HTTPException(
+            status_code=status, detail={"code": exc.code, "message": str(exc)}
+        ) from None
+
+    async with session_scope(_require_db(db)) as s:
+        await _audit(s, admin, "user.create", user.id, email=user.email, role=user.role)
+    return _shape_user(user)
+
+
+@router.post("/users/{user_id}/force-password-reset", response_model=Acknowledged)
+async def force_password_reset(
+    user_id: str,
+    request: Request,
+    admin: AuthUser | None = Depends(require_admin_user),
+    db=Depends(get_db),
+) -> Acknowledged:
+    """Cut a user off and email them a code to set a new password.
+
+    The remedy for "this account may be compromised": sessions die first, then
+    the code goes out, so there is no window in which a stolen session is still
+    usable.
+    """
+    accounts = request.app.state.accounts
+    if accounts is None:
+        raise HTTPException(status_code=503, detail="The admin panel needs a database.")
+    if not await accounts.admin_force_reset(user_id):
+        raise HTTPException(status_code=404, detail="No such user.")
+    async with session_scope(_require_db(db)) as s:
+        await _audit(s, admin, "user.force_reset", _uid(user_id))
+    return Acknowledged(message="Sessions revoked and a reset code sent.")
+
+
+@router.post("/users/{user_id}/unlock", response_model=Acknowledged)
+async def unlock_user(
+    user_id: str,
+    request: Request,
+    admin: AuthUser | None = Depends(require_admin_user),
+    db=Depends(get_db),
+) -> Acknowledged:
+    """Clear a login lockout.
+
+    Required, not a convenience: without it the only remedy for a locked-out
+    user is waiting out the backoff, which reaches an hour. `graphrag unlock`
+    is the equivalent for when the locked-out account is the only admin.
+    """
+    accounts = request.app.state.accounts
+    if accounts is None:
+        raise HTTPException(status_code=503, detail="The admin panel needs a database.")
+    if not await accounts.unlock(user_id):
+        raise HTTPException(status_code=404, detail="No such user.")
+    async with session_scope(_require_db(db)) as s:
+        await _audit(s, admin, "user.unlock", _uid(user_id))
+    return Acknowledged(message="Account unlocked.")
 
 
 @router.patch("/users/{user_id}", response_model=AdminUser)

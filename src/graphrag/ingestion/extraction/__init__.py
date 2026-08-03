@@ -1,3 +1,3 @@
-from graphrag.ingestion.extraction.graph_extractor import LLMGraphExtractor
+from graphrag.ingestion.extraction.graph_extractor import Extraction, LLMGraphExtractor
 
-__all__ = ["LLMGraphExtractor"]
+__all__ = ["Extraction", "LLMGraphExtractor"]

@@ -142,6 +142,10 @@ class HealthResponse(BaseModel):
     version: str
     provider: str
     model: str | None
+    # Every judge link, primary first. One entry means no failover configured —
+    # worth being able to see from outside, since the guard fails open and a
+    # single dead provider silently stops all screening.
+    chain: list[str] = Field(default_factory=list)
     policies: list[str] = Field(default_factory=list)
 
 

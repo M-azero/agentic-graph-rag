@@ -16,7 +16,7 @@ from graphrag.accounts import AccountService, PgKeyStore
 from graphrag.api.app import create_app
 from graphrag.api.deps import SESSION_COOKIE
 from graphrag.container import Container
-from tests.integration.conftest import requires_db
+from tests.integration.conftest import relax_auth_limits, requires_db
 
 pytestmark = [pytest.mark.integration, requires_db]
 
@@ -39,6 +39,7 @@ async def client(db, email_sender):
     container = Container()
     container.settings.auth.enabled = True
     container.settings.storage.vector.provider = "duckdb"
+    relax_auth_limits(container)
 
     app = create_app(container)
     app.state.db = db

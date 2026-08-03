@@ -16,7 +16,7 @@ from graphrag.api.app import create_app
 from graphrag.container import Container
 from graphrag.limits import LimitService
 from graphrag.usage import UsageRecorder
-from tests.integration.conftest import requires_db
+from tests.integration.conftest import relax_auth_limits, requires_db
 from tests.integration.test_limits_api import StubQueryService
 from tests.unit.test_limits_service import FakeRedis
 
@@ -32,6 +32,7 @@ async def client(db, email_sender):
     container = Container()
     container.settings.auth.enabled = True
     container.settings.storage.vector.provider = "duckdb"
+    relax_auth_limits(container)
     container.secrets.admin_api_key = ADMIN_KEY
 
     app = create_app(container)
@@ -335,3 +336,123 @@ async def test_keeping_the_account_wipes_only_the_content(client, email_sender):
         "/auth/login", json={"email": "alice@example.com", "password": PASSWORD}
     )
     assert login.status_code == 200
+
+
+# -- account management -------------------------------------------------------
+
+async def test_admin_can_invite_an_account(client, email_sender):
+    """What makes `open_registration: false` usable rather than a dead end.
+
+    No password crosses this boundary: the invitee gets a code and sets their
+    own through the ordinary reset flow.
+    """
+    r = await client.post(
+        "/admin/users",
+        json={"email": "new@example.com", "role": "user"},
+        headers=ADMIN_HEADERS,
+    )
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["email"] == "new@example.com"
+    assert body["status"] == "active"
+    assert body["email_verified"] is True
+    assert body["tenant_id"]
+
+    subject = email_sender.sent[-1][1]
+    assert "password" in subject.lower()
+    code = email_sender.last_code("new@example.com")
+
+    # The invite code is a reset code, so it drives the ordinary reset flow.
+    reset = await client.post(
+        "/auth/reset-password",
+        json={"email": "new@example.com", "code": code, "password": PASSWORD},
+    )
+    assert reset.status_code == 200, reset.text
+    login = await client.post(
+        "/auth/login", json={"email": "new@example.com", "password": PASSWORD}
+    )
+    assert login.status_code == 200
+
+
+async def test_inviting_an_existing_address_is_a_409(client, email_sender):
+    await _signup(client, email_sender, "alice@example.com")
+    client.cookies.clear()
+    r = await client.post(
+        "/admin/users", json={"email": "alice@example.com"}, headers=ADMIN_HEADERS
+    )
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "already_exists"
+
+
+async def test_invite_rejects_an_unknown_role(client):
+    r = await client.post(
+        "/admin/users",
+        json={"email": "new@example.com", "role": "superuser"},
+        headers=ADMIN_HEADERS,
+    )
+    assert r.status_code == 400
+
+
+async def test_forcing_a_reset_cuts_the_user_off_and_mails_a_code(
+    client, email_sender
+):
+    user_id = await _signup(client, email_sender, "alice@example.com")
+    assert (await client.get("/auth/me")).status_code == 200
+    stolen = dict(client.cookies)
+    client.cookies.clear()
+
+    r = await client.post(
+        f"/admin/users/{user_id}/force-password-reset", headers=ADMIN_HEADERS
+    )
+    assert r.status_code == 200, r.text
+
+    # The session that existed before the reset is dead.
+    for name, value in stolen.items():
+        client.cookies.set(name, value)
+    assert (await client.get("/auth/me")).status_code == 401
+    client.cookies.clear()
+
+    code = email_sender.last_code("alice@example.com")
+    new_password = "a-brand-new-secret-value"
+    reset = await client.post(
+        "/auth/reset-password",
+        json={"email": "alice@example.com", "code": code, "password": new_password},
+    )
+    assert reset.status_code == 200, reset.text
+
+
+async def test_forcing_a_reset_on_an_unknown_user_is_404(client):
+    import uuid
+
+    r = await client.post(
+        f"/admin/users/{uuid.uuid4()}/force-password-reset", headers=ADMIN_HEADERS
+    )
+    assert r.status_code == 404
+
+
+async def test_unlock_clears_a_lockout(client, email_sender):
+    user_id = await _signup(client, email_sender, "alice@example.com")
+    client.cookies.clear()
+
+    r = await client.post(f"/admin/users/{user_id}/unlock", headers=ADMIN_HEADERS)
+    assert r.status_code == 200
+    detail = (await client.get(f"/admin/users/{user_id}", headers=ADMIN_HEADERS)).json()
+    assert detail["user"]["locked_until"] is None
+    assert detail["user"]["failed_logins"] == 0
+
+
+async def test_account_management_is_audited(client, email_sender):
+    """"Who reset this user's password" is the first question asked afterwards."""
+    user_id = await _signup(client, email_sender, "alice@example.com")
+    client.cookies.clear()
+
+    await client.post("/admin/users", json={"email": "new@example.com"}, headers=ADMIN_HEADERS)
+    await client.post(
+        f"/admin/users/{user_id}/force-password-reset", headers=ADMIN_HEADERS
+    )
+    await client.post(f"/admin/users/{user_id}/unlock", headers=ADMIN_HEADERS)
+
+    actions = {
+        e["action"] for e in (await client.get("/admin/audit", headers=ADMIN_HEADERS)).json()
+    }
+    assert {"user.create", "user.force_reset", "user.unlock"} <= actions

@@ -36,7 +36,7 @@ from graphrag.config.settings import Settings
 from graphrag.container import sanitize_user
 from graphrag.core.logging import get_logger
 from graphrag.db.engine import session_scope
-from graphrag.db.models import EmailOTP, User
+from graphrag.db.models import PURPOSE_RESET, PURPOSE_VERIFY, EmailOTP, User
 from graphrag.db.models import Session as SessionRow
 
 log = get_logger(__name__)
@@ -52,6 +52,10 @@ class AccountError(Exception):
     def __init__(self, message: str, code: str = "invalid") -> None:
         super().__init__(message)
         self.code = code
+        # Seconds until the caller may retry. Only meaningful for
+        # `too_many_attempts`; 0 everywhere else, so routers can pass it
+        # through unconditionally.
+        self.retry_after = 0
 
 
 @dataclass(frozen=True)
@@ -66,6 +70,22 @@ class Principal:
     @property
     def is_admin(self) -> bool:
         return self.role == "admin"
+
+
+@dataclass(frozen=True)
+class SessionSummary:
+    """One live session, for the "signed-in devices" list.
+
+    Carries `token_hash` so the router can mark which row is the caller's own
+    without the service needing to know about cookies.
+    """
+
+    id: str
+    token_hash: str
+    created_at: datetime | None
+    last_seen_at: datetime | None
+    ip: str | None
+    user_agent: str | None
 
 
 def _now() -> datetime:
@@ -84,6 +104,43 @@ def _hash_token(token: str) -> str:
     import hashlib
 
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def hash_session_token(token: str) -> str:
+    """The stored form of a session cookie, for callers that need to compare
+    one against a `SessionSummary` without holding the plaintext twice."""
+    return _hash_token(token)
+
+
+def _maybe_uuid(value) -> uuid.UUID | None:
+    """A user id as a UUID, or None when it isn't one.
+
+    With auth disabled the identity is whatever `X-User-Id` said, so it is a
+    sanitized name rather than a key. Endpoints that reach the accounts tables
+    have to answer "no such user" for those rather than raising ValueError out
+    of a query and turning a 404 into a 500.
+    """
+    try:
+        return uuid.UUID(str(value))
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+
+def lockout_delay(failures: int, threshold: int, base: int, maximum: int) -> int:
+    """How long to lock an account after `failures` consecutive bad passwords.
+
+    Zero below the threshold, then doubling from `base` to a ceiling: the first
+    lock past the line is short enough that a real user who mistyped waits
+    seconds, while a script that keeps going is quickly spending an hour per
+    attempt. Pure and parameterised so the policy can be tested without a
+    database or a clock.
+    """
+    if threshold <= 0 or failures < threshold:
+        return 0
+    # 2**over can be enormous once an attacker keeps hammering a locked
+    # account; cap the exponent before computing it rather than after.
+    over = min(failures - threshold, 32)
+    return min(base * (2**over), maximum)
 
 
 def _tenant_for(email: str) -> str:
@@ -182,15 +239,7 @@ class AccountService:
             if user.status != "pending":
                 raise AccountError("This account cannot be verified.", "not_verifiable")
 
-            otp = (
-                await s.execute(
-                    select(EmailOTP)
-                    .where(EmailOTP.user_id == user.id, EmailOTP.consumed_at.is_(None))
-                    .order_by(EmailOTP.id.desc())
-                    .limit(1)
-                    .with_for_update()
-                )
-            ).scalar_one_or_none()
+            otp = await self._latest_otp(s, user, PURPOSE_VERIFY)
             if otp is None:
                 raise AccountError("Request a new code.", "no_code")
             if otp.expires_at <= _now():
@@ -235,25 +284,101 @@ class AccountService:
     async def login(
         self, email: str, password: str, ip: str | None = None, user_agent: str | None = None
     ) -> tuple[Principal, str]:
+        """Exchange a password for a session, counting failures against a lock.
+
+        The structure is unusual on purpose. Every rejection *records* something
+        (a failure count, possibly a lock), and that record has to survive the
+        rejection — so the transaction computes a `failure` and exits normally,
+        committing, and the error is raised afterwards. Raising from inside
+        `session_scope` would roll the increment back with the exception: the
+        counter would never rise and the lock would never engage. This is the
+        same trap `verify()` documents above, arrived at from the other side.
+
+        `verify_password` runs before any branch, including for a missing or
+        locked account, so every outcome costs one Argon2 hash. Skipping it for
+        a locked account would make lock state observable by timing, and
+        skipping it for an unknown address would make registration observable —
+        which is what `_DUMMY_HASH` exists to prevent.
+
+        Accepted trade-off: `too_many_attempts` is only ever returned for an
+        address that exists, so it is an enumeration oracle. It is kept because
+        the per-IP limit on this endpoint caps how fast that can be farmed, and
+        because a locked-out user told nothing concludes the product is broken.
+        The same trade is already made by `email_unverified` (403 vs 401), for
+        the same reason.
+        """
         email = normalize_email(email)
+        threshold = self._auth.lockout_threshold
+        failure: tuple[str, str, int] | None = None
+        principal: Principal | None = None
+        token = ""
+
         async with session_scope(self._factory) as s:
             user = await self._by_email(s, email)
-            # Verify even when the user is missing, against a dummy hash, so a
-            # failed login costs the same either way — the timing difference
-            # would otherwise reveal which addresses exist.
             stored = user.password_hash if user else _DUMMY_HASH
             ok = verify_password(stored, password)
-            if user is None or not ok:
-                raise AccountError("Email or password is incorrect.", "invalid_credentials")
-            if user.status == "pending":
-                raise AccountError("Verify your email address first.", "email_unverified")
-            if user.status != "active":
-                raise AccountError("This account is not active.", "account_inactive")
+            now = _now()
 
-            user.last_login_at = _now()
-            principal = self._principal(user)
-            token = await self._open_session(s, user, ip=ip, user_agent=user_agent)
+            locked_for = 0
+            if user is not None and user.locked_until is not None:
+                locked_for = int((user.locked_until - now).total_seconds())
+
+            if locked_for > 0:
+                failure = (
+                    "too_many_attempts",
+                    "Too many failed attempts. Try again later.",
+                    locked_for,
+                )
+            elif user is None or not ok:
+                if user is not None and threshold > 0:
+                    user.failed_logins += 1
+                    if user.failed_logins >= threshold:
+                        wait = lockout_delay(
+                            user.failed_logins,
+                            threshold,
+                            self._auth.lockout_base_seconds,
+                            self._auth.lockout_max_seconds,
+                        )
+                        user.locked_until = now + timedelta(seconds=wait)
+                        log.warning(
+                            "account_locked",
+                            user=str(user.id),
+                            failures=user.failed_logins,
+                            seconds=wait,
+                        )
+                failure = ("invalid_credentials", "Email or password is incorrect.", 0)
+            elif user.status == "pending":
+                failure = ("email_unverified", "Verify your email address first.", 0)
+            elif user.status != "active":
+                failure = ("account_inactive", "This account is not active.", 0)
+            else:
+                # A correct password clears the count: the lock is there to slow
+                # guessing, not to punish someone who eventually remembered.
+                user.failed_logins = 0
+                user.locked_until = None
+                user.last_login_at = now
+                principal = self._principal(user)
+                token = await self._open_session(s, user, ip=ip, user_agent=user_agent)
+
+        if failure is not None:
+            code, message, retry_after = failure
+            error = AccountError(message, code)
+            error.retry_after = retry_after
+            raise error
+        assert principal is not None  # narrowing: set on the success branch
         return principal, token
+
+    async def unlock(self, user_id: str) -> bool:
+        """Clear a lockout. The admin action, and the CLI break-glass behind
+        `graphrag unlock` for when the only admin is the one locked out."""
+        async with session_scope(self._factory) as s:
+            user = await self._by_id(s, user_id)
+            if user is None:
+                return False
+            user.failed_logins = 0
+            user.locked_until = None
+        log.info("account_unlocked", user=str(user_id))
+        return True
 
     async def resolve_session(self, token: str) -> Principal | None:
         """Identify the holder of a session cookie, or None."""
@@ -299,26 +424,280 @@ class AccountService:
             )
         self._cache_drop(token_hash)
 
-    async def revoke_sessions(self, user_id: str) -> int:
+    async def revoke_sessions(self, user_id: str, except_token: str | None = None) -> int:
         """Drop every session a user holds (suspension, password change, or an
-        admin cutting someone off)."""
+        admin cutting someone off).
+
+        `except_token` spares the caller's own session, which is what
+        "sign out everywhere else" needs — without it the user would have to
+        sign back in on the device they just used to secure the account.
+        """
+        owner = _maybe_uuid(user_id)
+        if owner is None:
+            return 0
+        keep = _hash_token(except_token) if except_token else None
+        where = [SessionRow.user_id == owner, SessionRow.revoked_at.is_(None)]
+        if keep is not None:
+            where.append(SessionRow.token_hash != keep)
         async with session_scope(self._factory) as s:
             hashes = (
-                await s.execute(
-                    select(SessionRow.token_hash).where(
-                        SessionRow.user_id == user_id, SessionRow.revoked_at.is_(None)
-                    )
-                )
+                await s.execute(select(SessionRow.token_hash).where(*where))
             ).scalars().all()
             if hashes:
                 await s.execute(
-                    update(SessionRow)
-                    .where(SessionRow.user_id == user_id, SessionRow.revoked_at.is_(None))
-                    .values(revoked_at=_now())
+                    update(SessionRow).where(*where).values(revoked_at=_now())
                 )
         for h in hashes:
             self._cache_drop(h)
         return len(hashes)
+
+    async def list_sessions(self, user_id: str) -> list[SessionSummary]:
+        """The user's live sessions, newest activity first.
+
+        `ip` and `user_agent` have been recorded on every login since the first
+        migration and read by nothing until now; showing them is what lets
+        someone notice a session they don't recognise.
+        """
+        owner = _maybe_uuid(user_id)
+        if owner is None:
+            return []
+        async with session_scope(self._factory) as s:
+            rows = (
+                await s.execute(
+                    select(SessionRow)
+                    .where(
+                        SessionRow.user_id == owner,
+                        SessionRow.revoked_at.is_(None),
+                        SessionRow.expires_at > _now(),
+                    )
+                    .order_by(
+                        SessionRow.last_seen_at.desc().nullslast(),
+                        SessionRow.created_at.desc(),
+                    )
+                )
+            ).scalars().all()
+            return [
+                SessionSummary(
+                    id=str(r.id),
+                    token_hash=r.token_hash,
+                    created_at=r.created_at,
+                    last_seen_at=r.last_seen_at,
+                    ip=str(r.ip) if r.ip else None,
+                    user_agent=r.user_agent,
+                )
+                for r in rows
+            ]
+
+    async def revoke_session(self, user_id: str, session_id: str) -> str | None:
+        """Revoke one of *this user's* sessions; return its token hash, or None.
+
+        Scoped by owner in the WHERE clause rather than checked afterwards, so
+        another user's session id is indistinguishable from one that never
+        existed — both return None and the router answers 404, matching how
+        threads, jobs and files already behave.
+        """
+        sid = _maybe_uuid(session_id)
+        owner = _maybe_uuid(user_id)
+        if sid is None or owner is None:
+            return None
+        async with session_scope(self._factory) as s:
+            row = (
+                await s.execute(
+                    select(SessionRow).where(
+                        SessionRow.id == sid,
+                        SessionRow.user_id == owner,
+                        SessionRow.revoked_at.is_(None),
+                    )
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                return None
+            row.revoked_at = _now()
+            token_hash = row.token_hash
+        self._cache_drop(token_hash)
+        return token_hash
+
+    # -- passwords ------------------------------------------------------------
+    async def request_password_reset(self, email: str) -> None:
+        """Email a reset code, or do nothing — indistinguishably.
+
+        Silent for unknown addresses and for accounts that cannot use a
+        password anyway (pending, suspended, deleted). The caller says the same
+        thing either way, so this cannot be used to test whether an address is
+        registered.
+        """
+        email = normalize_email(email)
+        code = None
+        async with session_scope(self._factory) as s:
+            user = await self._by_email(s, email)
+            if user is not None and user.status == "active":
+                code = await self._issue_otp(s, user, PURPOSE_RESET)
+        if code is not None:
+            await self._send_reset_code(email, code)
+
+    async def reset_password(self, email: str, code: str, new_password: str) -> None:
+        """Set a new password using an emailed code.
+
+        Two transactions for the same reason `verify()` uses two: the attempt
+        counter must be committed before the guess is judged, or a wrong code
+        rolls the increment back and the six-digit space is brute-forceable at
+        request speed.
+
+        Deliberately does not open a session. Signing the user in here would
+        mean a stolen code is a login; making them enter the new password once
+        proves they know it and puts them through the normal, rate-limited path.
+        """
+        email = normalize_email(email)
+        problem = validate_password(new_password)
+        if problem:
+            raise AccountError(problem, "weak_password")
+
+        # 1. Charge the attempt. Commits whether or not the guess is right.
+        async with session_scope(self._factory) as s:
+            user = await self._by_email(s, email)
+            if user is None or user.status != "active":
+                raise AccountError("That code is not valid.", "invalid_code")
+            otp = await self._latest_otp(s, user, PURPOSE_RESET)
+            if otp is None:
+                raise AccountError("Request a new code.", "no_code")
+            if otp.expires_at <= _now():
+                raise AccountError("That code has expired. Request a new one.", "expired_code")
+            if otp.attempts >= self._auth.otp_max_attempts:
+                raise AccountError(
+                    "Too many attempts. Request a new code.", "too_many_attempts"
+                )
+            otp.attempts += 1
+            otp_id = otp.id
+            matched = secrets.compare_digest(otp.code_hash, _hash_token(code.strip()))
+
+        if not matched:
+            raise AccountError("That code is not valid.", "invalid_code")
+
+        # 2. The code was right: consume it and set the password.
+        async with session_scope(self._factory) as s:
+            user = await self._by_email(s, email)
+            if user is None or user.status != "active":
+                raise AccountError("That code is not valid.", "invalid_code")
+            otp = (
+                await s.execute(
+                    select(EmailOTP).where(
+                        EmailOTP.id == otp_id, EmailOTP.consumed_at.is_(None)
+                    )
+                )
+            ).scalar_one_or_none()
+            if otp is None:  # raced with another reset using the same code
+                raise AccountError("That code is not valid.", "invalid_code")
+            otp.consumed_at = _now()
+            user.password_hash = hash_password(new_password)
+            user.password_changed_at = _now()
+            # Whoever forced the reset may have been in the account already.
+            user.failed_logins = 0
+            user.locked_until = None
+            user_id = str(user.id)
+
+        # Outside the transaction: a reset is also the remedy for "someone else
+        # is signed in as me", so every existing session has to go.
+        await self.revoke_sessions(user_id)
+        log.info("password_reset", user=user_id)
+
+    async def change_password(
+        self, user_id: str, current_password: str, new_password: str
+    ) -> str:
+        """Change a signed-in user's password; return a fresh session token.
+
+        Every existing session is revoked, including the caller's, and a new one
+        is opened. Rotating rather than sparing the current token means a
+        session captured before the change cannot outlive it — the tab the user
+        is looking at stays signed in only because it is handed a new cookie.
+        """
+        problem = validate_password(new_password)
+        if problem:
+            raise AccountError(problem, "weak_password")
+
+        async with session_scope(self._factory) as s:
+            user = await self._by_id(s, user_id)
+            if user is None:
+                raise AccountError("This account no longer exists.", "no_account")
+            if not verify_password(user.password_hash, current_password):
+                raise AccountError(
+                    "That is not your current password.", "current_password_invalid"
+                )
+            if verify_password(user.password_hash, new_password):
+                raise AccountError(
+                    "The new password must be different from the current one.",
+                    "password_unchanged",
+                )
+            user.password_hash = hash_password(new_password)
+            user.password_changed_at = _now()
+
+        await self.revoke_sessions(user_id)
+        async with session_scope(self._factory) as s:
+            user = await self._by_id(s, user_id)
+            if user is None:  # pragma: no cover - deleted mid-change
+                raise AccountError("This account no longer exists.", "no_account")
+            token = await self._open_session(s, user)
+        log.info("password_changed", user=str(user_id))
+        return token
+
+    # -- admin-driven account management --------------------------------------
+    async def admin_create_user(self, email: str, role: str = "user") -> User:
+        """Create an active account and email a code to set its password.
+
+        The password is random and never shown to anyone: the invitee sets
+        their own through the ordinary reset flow, so there is no shared
+        secret in an inbox and no code path here that a normal reset does not
+        already exercise. The account is created verified — an admin typing
+        the address is the verification.
+        """
+        email = normalize_email(email)
+        if not email or "@" not in email:
+            raise AccountError("Enter a valid email address.", "invalid_email")
+        if role not in ("user", "admin"):
+            raise AccountError("Role must be 'user' or 'admin'.", "invalid_role")
+
+        async with session_scope(self._factory) as s:
+            if await self._by_email(s, email) is not None:
+                raise AccountError("That address already has an account.", "already_exists")
+            user = User(
+                email=email,
+                password_hash=hash_password(secrets.token_urlsafe(32)),
+                tenant_id=_tenant_for(email),
+                status="active",
+                role=role,
+                email_verified_at=_now(),
+            )
+            s.add(user)
+            await s.flush()
+            code = await self._issue_otp(s, user, PURPOSE_RESET)
+            await s.refresh(user)
+            s.expunge(user)
+            log.info("account_invited", user=str(user.id), role=role)
+
+        await self._send_invite(email, code)
+        return user
+
+    async def admin_force_reset(self, user_id: str) -> bool:
+        """Cut a user off and email them a code to set a new password.
+
+        Sessions and the reset code are handled in that order on purpose: the
+        account is locked out first, so a compromised session cannot be used in
+        the window between the two.
+        """
+        async with session_scope(self._factory) as s:
+            user = await self._by_id(s, user_id)
+            if user is None or user.status == "deleted":
+                return False
+            email = user.email
+
+        await self.revoke_sessions(user_id)
+        async with session_scope(self._factory) as s:
+            user = await self._by_id(s, user_id)
+            if user is None:  # pragma: no cover - deleted mid-reset
+                return False
+            code = await self._issue_otp(s, user, PURPOSE_RESET)
+        await self._send_reset_code(email, code)
+        log.info("password_reset_forced", user=str(user_id))
+        return True
 
     # -- admin bootstrap ------------------------------------------------------
     async def promote_admin(self, email: str) -> bool:
@@ -340,9 +719,11 @@ class AccountService:
 
     async def get_by_id(self, user_id: str) -> User | None:
         async with session_scope(self._factory) as s:
-            return (
-                await s.execute(select(User).where(User.id == uuid.UUID(str(user_id))))
-            ).scalar_one_or_none()
+            return await self._by_id(s, user_id)
+
+    async def get_by_email(self, email: str) -> User | None:
+        async with session_scope(self._factory) as s:
+            return await self._by_email(s, normalize_email(email))
 
     # -- internals ------------------------------------------------------------
     @staticmethod
@@ -350,17 +731,41 @@ class AccountService:
         return Principal(str(user.id), user.tenant_id, user.role, user.email)
 
     @staticmethod
+    async def _by_id(s: AsyncSession, user_id: str) -> User | None:
+        """Load a user by primary key, or None — including when the id is not a
+        UUID at all, which is what a dev-mode identity looks like."""
+        key = _maybe_uuid(user_id)
+        if key is None:
+            return None
+        return (
+            await s.execute(select(User).where(User.id == key))
+        ).scalar_one_or_none()
+
+    @staticmethod
     async def _by_email(s: AsyncSession, email: str) -> User | None:
         return (
             await s.execute(select(User).where(func.lower(User.email) == email))
         ).scalar_one_or_none()
 
-    async def _issue_otp(self, s: AsyncSession, user: User) -> str:
-        # Invalidate outstanding codes: two live codes doubles the guess space
-        # for the same attempt budget.
+    async def _issue_otp(
+        self, s: AsyncSession, user: User, purpose: str = PURPOSE_VERIFY
+    ) -> str:
+        """Mint a code, replacing any outstanding one *of the same purpose*.
+
+        Scoped by purpose in both directions. Without the filter, asking for a
+        password reset would silently consume a pending signup code — the user
+        would be told to check their inbox for a verification code that had
+        just been invalidated by the reset they also asked for. Within one
+        purpose the invalidation is deliberate: two live codes double the guess
+        space for the same attempt budget.
+        """
         await s.execute(
             update(EmailOTP)
-            .where(EmailOTP.user_id == user.id, EmailOTP.consumed_at.is_(None))
+            .where(
+                EmailOTP.user_id == user.id,
+                EmailOTP.purpose == purpose,
+                EmailOTP.consumed_at.is_(None),
+            )
             .values(consumed_at=_now())
         )
         code = _generate_code()
@@ -368,11 +773,33 @@ class AccountService:
             EmailOTP(
                 user_id=user.id,
                 code_hash=_hash_token(code),
-                purpose="verify",
+                purpose=purpose,
                 expires_at=_now() + timedelta(minutes=self._auth.otp_ttl_minutes),
             )
         )
         return code
+
+    @staticmethod
+    async def _latest_otp(s: AsyncSession, user: User, purpose: str) -> EmailOTP | None:
+        """The one live code for this purpose, locked for update.
+
+        The `purpose` filter is load-bearing: without it a password-reset code
+        would be accepted at /auth/verify and vice versa, which turns two
+        separate proofs into one.
+        """
+        return (
+            await s.execute(
+                select(EmailOTP)
+                .where(
+                    EmailOTP.user_id == user.id,
+                    EmailOTP.purpose == purpose,
+                    EmailOTP.consumed_at.is_(None),
+                )
+                .order_by(EmailOTP.id.desc())
+                .limit(1)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
 
     async def _send_code(self, email: str, code: str) -> None:
         minutes = self._auth.otp_ttl_minutes
@@ -381,6 +808,27 @@ class AccountService:
             "Your verification code",
             f"Your verification code is {code}\n\n"
             f"It expires in {minutes} minutes. If you didn't request it, ignore this email.",
+        )
+
+    async def _send_reset_code(self, email: str, code: str) -> None:
+        minutes = self._auth.otp_ttl_minutes
+        await self._email.send(
+            email,
+            "Reset your password",
+            f"Your password reset code is {code}\n\n"
+            f"It expires in {minutes} minutes. If you didn't request it, ignore this "
+            "email — your password has not changed.",
+        )
+
+    async def _send_invite(self, email: str, code: str) -> None:
+        minutes = self._auth.otp_ttl_minutes
+        await self._email.send(
+            email,
+            "Set your password",
+            f"An account has been created for you.\n\n"
+            f"Your setup code is {code}\n\n"
+            f"It expires in {minutes} minutes. Use it on the 'forgot password' page "
+            "to choose a password and sign in.",
         )
 
     async def _open_session(

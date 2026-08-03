@@ -17,7 +17,7 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 FailMode = Literal["open", "closed", "flag"]
@@ -44,6 +44,53 @@ class Settings(BaseSettings):
     llm_base_url: str | None = None
     llm_timeout_s: float = Field(default=10.0, gt=0)
     llm_max_tokens: int = Field(default=1024, gt=0)
+
+    # ── Judge failover chain ────────────────────────────────────────────────
+    # Judges tried in order after the primary above, as a comma-separated list
+    # of ``provider:model`` (a bare ``provider`` uses that preset's default
+    # model, and ``provider:model@https://host/v1`` overrides the base URL):
+    #
+    #     GUARD_LLM_FALLBACKS=deepseek:deepseek-v4-flash,cohere:command-a-03-2025
+    #
+    # This matters more than an ordinary fallback list. The guard fails *open*:
+    # when no judge answers, every verdict is `judge_unavailable` and requests
+    # sail through unscreened with nothing but a log line to say so. One dead
+    # provider should not be able to do that, so put the links on DIFFERENT
+    # VENDORS — a second model at the same vendor shares the outage and the key.
+    #
+    # Each link resolves its own key from that preset's native env var
+    # (DEEPSEEK_API_KEY, COHERE_API_KEY, ...), never from GUARD_LLM_API_KEY,
+    # which belongs to the primary. Links with no key are dropped at startup
+    # and named in the log rather than left to 401 on every request.
+    llm_fallbacks: str = ""
+
+    # Consecutive failures that take a link out of rotation, and for how long.
+    # A refused key answers in ~200ms and paying that on every request adds up;
+    # a tripped link is retried once the cooldown expires and rejoins on its
+    # first success. Tripped links are still tried as a last resort when every
+    # other link is also down — a stale breaker must not be the reason nothing
+    # gets screened.
+    llm_failover_max_failures: int = Field(default=2, ge=1)
+    llm_failover_cooldown_s: float = Field(default=300.0, ge=0)
+
+    # Wall-clock ceiling for one verdict across the WHOLE chain, including the
+    # repair retry. Without it the budget is per-link, so a 3-link chain can
+    # spend 3x llm_timeout_s and blow past the caller's own timeout — at which
+    # point the caller has already given up and failed open, and the chain is
+    # burning tokens to produce a verdict nobody will read. Unset means no
+    # overall cap (the historical single-provider behaviour).
+    llm_total_timeout_s: float | None = Field(default=None, gt=0)
+
+    @field_validator("llm_total_timeout_s", mode="before")
+    @classmethod
+    def _blank_means_unset(cls, v: object) -> object:
+        """Treat an empty value as "not configured".
+
+        A container orchestrator can pass a variable but cannot omit one, so
+        this arrives as ``GUARD_LLM_TOTAL_TIMEOUT_S=""`` whenever it is left
+        unset. Without this the process refuses to start on a blank string.
+        """
+        return None if v in ("", None) else v
 
     # ── Policy / behaviour ──────────────────────────────────────────────────
     fail_mode: FailMode = "flag"

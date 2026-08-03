@@ -9,7 +9,9 @@ judge parses. Three implementations:
 * :class:`MockProvider`           — deterministic, offline; drives every test.
 
 ``PRESETS`` maps a provider name to its base URL, native key env var, default model, and
-whether it supports JSON mode. ``build_provider(settings)`` wires the right one together.
+whether it supports JSON mode. ``build_provider(settings)`` wires the right one together;
+``build_provider_chain(settings)`` adds the ``GUARD_LLM_FALLBACKS`` links behind it so a
+dead judge degrades to the next vendor instead of taking screening down with it.
 """
 
 from __future__ import annotations
@@ -64,6 +66,16 @@ PRESETS: dict[str, Preset] = {
         True,
     ),
     "deepseek": Preset("openai", "https://api.deepseek.com/v1", "DEEPSEEK_API_KEY", "deepseek-chat", True),
+    # Cohere speaks OpenAI on a *separate* path from its native API — the
+    # /compatibility/v1 prefix is required, /v1 is the native protocol and 404s
+    # the chat-completions shape.
+    "cohere": Preset(
+        "openai",
+        "https://api.cohere.ai/compatibility/v1",
+        "COHERE_API_KEY",
+        "command-a-03-2025",
+        True,
+    ),
     "qwen": Preset(
         "openai",
         "https://dashscope.aliyuncs.com/compatible-mode/v1",
@@ -303,6 +315,24 @@ def _mock_output_verdict(blob: str) -> dict:
 
 
 # ── Factory ─────────────────────────────────────────────────────────────────
+def _construct(
+    *, name: str, preset: Preset, model: str, base_url: str | None,
+    api_key: str | None, timeout: float,
+) -> LLMProvider:
+    if preset.provider_type == "mock":
+        return MockProvider(model=model)
+    if preset.provider_type == "anthropic":
+        return AnthropicProvider(model=model, api_key=api_key, timeout=timeout)
+    return OpenAICompatProvider(
+        name=name,
+        model=model,
+        api_key=api_key,
+        base_url=base_url,
+        timeout=timeout,
+        supports_json_mode=preset.supports_json_mode,
+    )
+
+
 def build_provider(settings: Settings) -> LLMProvider:
     """Construct the configured provider, resolving model / key / base_url from presets."""
     preset = PRESETS.get(settings.llm_provider)
@@ -328,13 +358,116 @@ def build_provider(settings: Settings) -> LLMProvider:
 
     api_key = settings.llm_api_key or (os.environ.get(preset.key_env) if preset.key_env else None)
 
-    if preset.provider_type == "anthropic":
-        return AnthropicProvider(model=model, api_key=api_key, timeout=settings.llm_timeout_s)
-    return OpenAICompatProvider(
-        name=settings.llm_provider,
-        model=model,
-        api_key=api_key,
-        base_url=base_url,
-        timeout=settings.llm_timeout_s,
-        supports_json_mode=preset.supports_json_mode,
+    return _construct(
+        name=settings.llm_provider, preset=preset, model=model, base_url=base_url,
+        api_key=api_key, timeout=settings.llm_timeout_s,
     )
+
+
+# ── Failover chain ──────────────────────────────────────────────────────────
+@dataclass(frozen=True)
+class ChainLink:
+    """One parsed entry of ``GUARD_LLM_FALLBACKS``."""
+
+    provider: str
+    model: str | None = None
+    base_url: str | None = None
+
+    @property
+    def label(self) -> str:
+        return f"{self.provider}:{self.model}" if self.model else self.provider
+
+
+def parse_chain_spec(spec: str) -> list[ChainLink]:
+    """Parse ``"deepseek:deepseek-v4-flash, cohere:command-a-03-2025"``.
+
+    Grammar per entry: ``provider[:model][@base_url]``. Provider is split on the
+    FIRST colon so model ids keep theirs; the ``@base_url`` suffix is only
+    recognised when the tail is an http(s) URL, so an ``@`` inside a model id
+    (or a userinfo-bearing URL) does not silently truncate the model name.
+    """
+    links: list[ChainLink] = []
+    for raw in spec.split(","):
+        entry = raw.strip()
+        if not entry:
+            continue
+        provider, _, rest = entry.partition(":")
+        provider = provider.strip()
+        if not provider:
+            raise ValueError(f"malformed GUARD_LLM_FALLBACKS entry: {entry!r}")
+
+        base_url: str | None = None
+        head, sep, tail = rest.rpartition("@")
+        if sep and tail.startswith(("http://", "https://")):
+            rest, base_url = head, tail
+
+        links.append(ChainLink(provider, rest.strip() or None, base_url))
+    return links
+
+
+def _resolve_key(link: ChainLink, preset: Preset, settings: Settings) -> str | None:
+    """Find the key for a fallback link.
+
+    The preset's own env var wins. ``GUARD_LLM_API_KEY`` holds the *primary's*
+    credential, and handing a DeepInfra token to DeepSeek does not fail loudly —
+    it 401s on every request, so the link looks configured, reports healthy at
+    startup, and contributes nothing. It is only reused when the link names the
+    same provider as the primary, or when the preset has no key of its own
+    (``custom``/``ollama``/``vllm``).
+    """
+    env_key = os.environ.get(preset.key_env) if preset.key_env else None
+    if env_key:
+        return env_key
+    if link.provider == settings.llm_provider or preset.key_env is None:
+        return settings.llm_api_key
+    return None
+
+
+def build_provider_chain(settings: Settings) -> tuple[list[LLMProvider], list[str]]:
+    """The primary judge plus every usable fallback, in order.
+
+    Returns ``(providers, skipped)`` — ``skipped`` names the links that were
+    dropped and why, so startup can log them. A link is dropped rather than
+    built when it has no credential or cannot be constructed: the chain exists
+    to be traversed under load, and a link that is certain to fail only spends
+    the failure budget that a working link further down needs.
+    """
+    providers: list[LLMProvider] = [build_provider(settings)]
+    seen = {(settings.llm_provider, providers[0].model)}
+    skipped: list[str] = []
+
+    for link in parse_chain_spec(settings.llm_fallbacks):
+        preset = PRESETS.get(link.provider)
+        if preset is None:
+            skipped.append(f"{link.label} (unknown provider)")
+            continue
+
+        model = link.model or preset.default_model
+        if not model:
+            skipped.append(f"{link.label} (no model, and this preset has no default)")
+            continue
+        if (link.provider, model) in seen:
+            skipped.append(f"{link.provider}:{model} (duplicate)")
+            continue
+
+        base_url = link.base_url or preset.base_url
+        if preset.provider_type == "openai" and not base_url:
+            skipped.append(f"{link.provider}:{model} (no base_url; use provider:model@https://...)")
+            continue
+
+        api_key = _resolve_key(link, preset, settings)
+        if preset.key_env and not api_key:
+            skipped.append(f"{link.provider}:{model} (no {preset.key_env})")
+            continue
+
+        try:
+            providers.append(_construct(
+                name=link.provider, preset=preset, model=model, base_url=base_url,
+                api_key=api_key, timeout=settings.llm_timeout_s,
+            ))
+        except Exception as exc:  # noqa: BLE001 - a bad link must not stop startup
+            skipped.append(f"{link.provider}:{model} ({type(exc).__name__}: {exc})")
+            continue
+        seen.add((link.provider, model))
+
+    return providers, skipped

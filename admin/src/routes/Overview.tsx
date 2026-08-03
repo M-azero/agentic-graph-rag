@@ -9,8 +9,9 @@ import {
   YAxis,
 } from "recharts";
 
-import { admin, type SystemStatus, type UsageSeries } from "../../api";
-import { Alert, Card, CardTitle, Select, Skeleton } from "../../components/ui";
+import { admin, type SystemStatus, type UsageSeries } from "../api";
+import { Stat, StatRail } from "../components/Stat";
+import { Alert, Card, EmptyState, Select, Skeleton, compactNumber } from "../components/ui";
 
 export default function Overview() {
   const [usage, setUsage] = useState<UsageSeries | null>(null);
@@ -19,56 +20,64 @@ export default function Overview() {
   const [error, setError] = useState("");
 
   useEffect(() => {
+    let alive = true;
     (async () => {
       try {
         const [u, s] = await Promise.all([admin.usage(days), admin.system()]);
+        if (!alive) return;
         setUsage(u);
         setSystem(s);
       } catch (err) {
-        setError(err instanceof Error ? err.message : "Could not load the overview.");
+        if (alive) {
+          setError(err instanceof Error ? err.message : "Could not load the overview.");
+        }
       }
     })();
+    return () => {
+      alive = false;
+    };
   }, [days]);
 
+  const number = (v?: number) => (v === undefined ? "—" : v.toLocaleString());
+
   return (
-    <div className="space-y-4">
+    <div className="space-y-5">
       {error && <Alert>{error}</Alert>}
 
-      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-        <Stat label="Users" value={system?.users} sub={`${system?.active_users ?? 0} active`} />
-        <Stat label="Conversations" value={system?.threads} />
-        <Stat label="Documents" value={system?.files} />
+      <StatRail>
         <Stat
-          label={`Messages (${days}d)`}
-          value={usage?.totals.messages}
-          sub={`${(usage?.totals.tokens ?? 0).toLocaleString()} tokens`}
+          label="Users"
+          value={number(system?.users)}
+          sub={`${system?.active_users ?? 0} active in 30d`}
         />
-      </div>
+        <Stat label="Conversations" value={number(system?.threads)} />
+        <Stat label="Documents" value={number(system?.files)} />
+        <Stat
+          label={`Messages · ${days}d`}
+          value={number(usage?.totals.messages)}
+          sub={`${compactNumber(usage?.totals.tokens ?? 0)} tokens`}
+        />
+      </StatRail>
 
-      <Card>
-        <CardTitle
-          action={
-            <Select
-              value={String(days)}
-              onChange={(e) => setDays(Number(e.target.value))}
-              className="h-7 w-auto text-[12px]"
-              aria-label="Time range"
-            >
-              <option value="7">7 days</option>
-              <option value="30">30 days</option>
-              <option value="90">90 days</option>
-            </Select>
-          }
-        >
-          Activity
-        </CardTitle>
-
+      <Card
+        title="Activity"
+        actions={
+          <Select
+            value={String(days)}
+            onChange={(e) => setDays(Number(e.target.value))}
+            className="h-7 !w-auto py-0 text-xs"
+            aria-label="Time range"
+          >
+            <option value="7">7 days</option>
+            <option value="30">30 days</option>
+            <option value="90">90 days</option>
+          </Select>
+        }
+      >
         {!usage ? (
           <Skeleton className="h-56 w-full" />
         ) : usage.points.length === 0 ? (
-          <p className="py-16 text-center text-[13px] text-muted">
-            No activity in this period.
-          </p>
+          <EmptyState title="No activity in this period" />
         ) : (
           <div className="h-56">
             <ResponsiveContainer width="100%" height="100%">
@@ -115,22 +124,6 @@ export default function Overview() {
         )}
       </Card>
     </div>
-  );
-}
-
-function Stat({ label, value, sub }: { label: string; value?: number; sub?: string }) {
-  return (
-    <Card>
-      <p className="text-[12px] text-muted">{label}</p>
-      {value === undefined ? (
-        <Skeleton className="mt-1.5 h-7 w-16" />
-      ) : (
-        <p className="mt-1 text-2xl font-semibold tracking-tight text-strong">
-          {value.toLocaleString()}
-        </p>
-      )}
-      {sub && <p className="mt-0.5 text-[12px] text-muted">{sub}</p>}
-    </Card>
   );
 }
 

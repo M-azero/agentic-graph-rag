@@ -1,19 +1,22 @@
-"""Sign-up, email verification, login, and personal API keys.
+"""Sign-up, email verification, login, passwords, sessions and API keys.
 
 The session cookie is httpOnly (JavaScript cannot read it, so an XSS bug cannot
 exfiltrate it) and SameSite=Lax (the browser withholds it from cross-site POSTs,
 which is the CSRF defence for the mutating endpoints here).
 
-Signup, resend and login are rate limited per IP: without that, the six-digit
-verification code and the password field are both brute-forceable at network
-speed, whatever the per-attempt caps say.
+Every endpoint reachable without credentials carries an `auth_throttle`
+dependency, keyed on the caller's address. Without that, the six-digit codes
+and the password field are brute-forceable at network speed whatever the
+per-attempt caps say — the caps bound guesses per *code*, not per second.
+`tests/unit/test_api_exposure.py` asserts the dependency is present on each of
+them, so a new endpoint here cannot quietly ship without one.
 """
 
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
-from graphrag.accounts import AccountError, AccountService
+from graphrag.accounts import AccountError, AccountService, hash_session_token
 from graphrag.api.deps import (
     SESSION_COOKIE,
     AuthUser,
@@ -23,17 +26,23 @@ from graphrag.api.deps import (
     get_db,
     get_key_store,
 )
+from graphrag.api.ratelimit import auth_throttle, client_ip, too_many_requests
 from graphrag.api.schemas import (
     Acknowledged,
     APIKeyCreate,
     APIKeyCreated,
     APIKeyInfo,
     APIKeyList,
+    ChangePasswordRequest,
     EmailRequest,
+    ForgotPasswordRequest,
     LimitsInfo,
     LoginRequest,
     Me,
     ModelOption,
+    ResetPasswordRequest,
+    SessionInfo,
+    SessionList,
     SignupRequest,
     VerifyRequest,
 )
@@ -48,12 +57,13 @@ log = get_logger(__name__)
 # Deliberately identical for known and unknown addresses — anything more
 # specific turns these endpoints into an account-enumeration oracle.
 _SENT = "If that address can be registered, we've sent a code to it."
+_RESET_SENT = "If that address has an account, we've sent a reset code to it."
 
 
 def _is_secure(request: Request) -> bool:
     """Did this request arrive over TLS? Trusts X-Forwarded-Proto, which the
-    bundled Caddy/nginx set — without it every request looks like plain HTTP
-    from behind a proxy."""
+    bundled Caddy sets — without it every request looks like plain HTTP from
+    behind a proxy."""
     forwarded = request.headers.get("X-Forwarded-Proto", "").split(",")[0].strip()
     return (forwarded or request.url.scheme) == "https"
 
@@ -84,14 +94,24 @@ def _require_accounts(accounts: AccountService | None) -> AccountService:
     return accounts
 
 
-def _client_ip(request: Request) -> str | None:
-    fwd = request.headers.get("X-Forwarded-For")
-    if fwd:
-        return fwd.split(",")[0].strip()
-    return request.client.host if request.client else None
+def _account_error(exc: AccountError, status: int) -> HTTPException:
+    """Turn a service error into an HTTP one, carrying its code through.
+
+    `too_many_attempts` from a lockout also carries `retry_after`, in the same
+    shape as the rate-limit and quota 429s, so the UI has one branch for
+    "come back later" rather than three.
+    """
+    detail: dict[str, object] = {"code": exc.code, "message": str(exc)}
+    if status == 429:
+        return too_many_requests(exc.retry_after or 60, str(exc))
+    return HTTPException(status_code=status, detail=detail)
 
 
-@router.post("/signup", response_model=Acknowledged)
+@router.post(
+    "/signup",
+    response_model=Acknowledged,
+    dependencies=[Depends(auth_throttle("signup"))],
+)
 async def signup(
     payload: SignupRequest,
     request: Request,
@@ -112,16 +132,25 @@ async def signup(
     return Acknowledged(message=_SENT)
 
 
-@router.post("/resend", response_model=Acknowledged)
+@router.post(
+    "/resend",
+    response_model=Acknowledged,
+    dependencies=[Depends(auth_throttle("resend"))],
+)
 async def resend(
     payload: EmailRequest,
+    request: Request,
     accounts: AccountService = Depends(get_accounts),
 ) -> Acknowledged:
     await _require_accounts(accounts).resend_code(payload.email)
     return Acknowledged(message=_SENT)
 
 
-@router.post("/verify", response_model=Me)
+@router.post(
+    "/verify",
+    response_model=Me,
+    dependencies=[Depends(auth_throttle("verify"))],
+)
 async def verify(
     payload: VerifyRequest,
     request: Request,
@@ -139,7 +168,11 @@ async def verify(
     return _me(principal, container)
 
 
-@router.post("/login", response_model=Me)
+@router.post(
+    "/login",
+    response_model=Me,
+    dependencies=[Depends(auth_throttle("login"))],
+)
 async def login(
     payload: LoginRequest,
     request: Request,
@@ -151,18 +184,149 @@ async def login(
         principal, token = await _require_accounts(accounts).login(
             payload.email,
             payload.password,
-            ip=_client_ip(request),
+            ip=client_ip(request),
             user_agent=request.headers.get("User-Agent"),
         )
     except AccountError as exc:
         # 403 for an unverified account so the UI can route to /verify;
+        # 429 when the account is locked, so the UI can say how long;
         # 401 for bad credentials.
-        status = 403 if exc.code in ("email_unverified", "account_inactive") else 401
-        raise HTTPException(
-            status_code=status, detail={"code": exc.code, "message": str(exc)}
-        ) from None
+        if exc.code == "too_many_attempts":
+            status = 429
+        elif exc.code in ("email_unverified", "account_inactive"):
+            status = 403
+        else:
+            status = 401
+        raise _account_error(exc, status) from None
     _set_session_cookie(response, token, container, request)
     return _me(principal, container)
+
+
+# -- passwords ----------------------------------------------------------------
+
+@router.post(
+    "/forgot-password",
+    response_model=Acknowledged,
+    dependencies=[Depends(auth_throttle("reset"))],
+)
+async def forgot_password(
+    payload: ForgotPasswordRequest,
+    request: Request,
+    accounts: AccountService = Depends(get_accounts),
+) -> Acknowledged:
+    """Start a password reset. Answers identically for every address."""
+    await _require_accounts(accounts).request_password_reset(payload.email)
+    return Acknowledged(message=_RESET_SENT)
+
+
+@router.post(
+    "/reset-password",
+    response_model=Acknowledged,
+    dependencies=[Depends(auth_throttle("reset"))],
+)
+async def reset_password(
+    payload: ResetPasswordRequest,
+    request: Request,
+    accounts: AccountService = Depends(get_accounts),
+) -> Acknowledged:
+    """Finish a password reset.
+
+    No session is opened: the user signs in with the new password through the
+    ordinary rate-limited path, so a stolen code alone is not a login.
+    """
+    try:
+        await _require_accounts(accounts).reset_password(
+            payload.email, payload.code, payload.password
+        )
+    except AccountError as exc:
+        raise _account_error(exc, 400) from None
+    return Acknowledged(message="Password updated. You can sign in now.")
+
+
+@router.post("/change-password", response_model=Acknowledged)
+async def change_password(
+    payload: ChangePasswordRequest,
+    request: Request,
+    response: Response,
+    user: AuthUser = Depends(get_current_user),
+    accounts: AccountService = Depends(get_accounts),
+    container: Container = Depends(get_container),
+) -> Acknowledged:
+    """Change your own password, signing out every device including this one.
+
+    The caller is handed a fresh cookie, so the tab they are looking at stays
+    usable — but the token it held before the change is dead, which is the
+    point: a session captured earlier cannot outlive the password it was
+    obtained under.
+    """
+    try:
+        token = await _require_accounts(accounts).change_password(
+            user.user_id, payload.current_password, payload.new_password
+        )
+    except AccountError as exc:
+        raise _account_error(exc, 400) from None
+    _set_session_cookie(response, token, container, request)
+    return Acknowledged(message="Password changed. Signed out on every other device.")
+
+
+# -- sessions -----------------------------------------------------------------
+
+@router.get("/sessions", response_model=SessionList)
+async def list_sessions(
+    request: Request,
+    user: AuthUser = Depends(get_current_user),
+    accounts: AccountService = Depends(get_accounts),
+) -> SessionList:
+    """Signed-in devices, newest activity first."""
+    cookie = request.cookies.get(SESSION_COOKIE)
+    current_hash = hash_session_token(cookie) if cookie else None
+    rows = await _require_accounts(accounts).list_sessions(user.user_id)
+    return SessionList(
+        sessions=[
+            SessionInfo(
+                id=r.id,
+                created_at=r.created_at.isoformat() if r.created_at else "",
+                last_seen_at=r.last_seen_at.isoformat() if r.last_seen_at else None,
+                ip=r.ip,
+                user_agent=r.user_agent,
+                current=r.token_hash == current_hash,
+            )
+            for r in rows
+        ]
+    )
+
+
+@router.delete("/sessions/{session_id}", response_model=Acknowledged)
+async def revoke_session(
+    session_id: str,
+    request: Request,
+    response: Response,
+    user: AuthUser = Depends(get_current_user),
+    accounts: AccountService = Depends(get_accounts),
+) -> Acknowledged:
+    """Sign one device out. 404 for a session that isn't yours — the same
+    answer as one that does not exist, so this cannot enumerate sessions."""
+    revoked = await _require_accounts(accounts).revoke_session(user.user_id, session_id)
+    if revoked is None:
+        raise HTTPException(status_code=404, detail="No such session.")
+    cookie = request.cookies.get(SESSION_COOKIE)
+    if cookie and hash_session_token(cookie) == revoked:
+        response.delete_cookie(SESSION_COOKIE, path="/")
+    return Acknowledged(message="Signed out.")
+
+
+@router.post("/sessions/revoke-all", response_model=Acknowledged)
+async def revoke_other_sessions(
+    request: Request,
+    user: AuthUser = Depends(get_current_user),
+    accounts: AccountService = Depends(get_accounts),
+) -> Acknowledged:
+    """Sign out everywhere else, keeping this device signed in."""
+    cookie = request.cookies.get(SESSION_COOKIE)
+    count = await _require_accounts(accounts).revoke_sessions(
+        user.user_id, except_token=cookie
+    )
+    return Acknowledged(message=f"Signed out {count} other device(s).")
 
 
 @router.post("/logout", response_model=Acknowledged)

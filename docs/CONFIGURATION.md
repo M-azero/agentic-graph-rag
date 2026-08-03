@@ -149,6 +149,47 @@ Off by default (dev). Turn on with `auth.enabled: true`:
   configured, `POST /users` / `GET /users` are locked — otherwise anyone could
   create a user and mint themselves a valid key.
 
+**Accounts and sessions:**
+
+| Key                    | Default | What it does |
+|------------------------|---------|--------------|
+| `open_registration`    | `true`  | `false` → only an admin can create accounts (use the console's **Invite**) |
+| `session_ttl_days`     | `30`    | Cookie lifetime and the session row's expiry |
+| `otp_ttl_minutes`      | `15`    | How long an emailed code stays valid |
+| `otp_max_attempts`     | `5`     | Guesses per code, for verification *and* password reset |
+| `cookie_secure`        | `auto`  | `auto` derives it per request from `X-Forwarded-Proto`. Pin to `"true"` (quoted) once every request arrives over TLS — a Secure cookie is silently discarded over plain HTTP |
+
+**Lockout after failed logins:**
+
+| Key                     | Default | What it does |
+|-------------------------|---------|--------------|
+| `lockout_threshold`     | `10`    | Consecutive failures before the account locks. `0` disables lockout |
+| `lockout_base_seconds`  | `60`    | The first lock past the threshold; each further failure doubles it |
+| `lockout_max_seconds`   | `3600`  | Ceiling on that backoff |
+
+Deliberately loose: someone working through a password manager should not lock
+themselves out, and `rate_limits` below is what caps attack volume. The lock is
+what stops a slow, distributed guess that stays under every rate limit. State
+lives in Postgres rather than Redis — the Redis counters used for quotas fail
+*open* by design, which is right for a quota and exactly wrong for a lockout.
+Clear one with `make unlock EMAIL=…` or the console's **Unlock** action.
+
+**Per-IP limits on unauthenticated endpoints (`auth.rate_limits`):**
+
+| Key      | Default      | Endpoint |
+|----------|--------------|----------|
+| `login`  | `10/minute`  | `POST /auth/login` |
+| `signup` | `5/minute`   | `POST /auth/signup` |
+| `verify` | `10/minute`  | `POST /auth/verify` |
+| `resend` | `3/minute`   | `POST /auth/resend` — tightest, because it sends email |
+| `reset`  | `5/minute`   | `POST /auth/forgot-password` and `/auth/reset-password` |
+
+These apply *in addition to* `api.rate_limit`, not instead of it. An empty
+string disables one. They key on `X-Real-IP`, which the bundled Caddy sets —
+`X-Forwarded-For` is appended to, so its first entry is attacker-controlled and
+is never trusted. `tests/unit/test_api_exposure.py` fails if a new
+unauthenticated `/auth/*` endpoint ships without one.
+
 ## Limits & resources
 
 **API limits (`api` block):**
@@ -156,7 +197,7 @@ Off by default (dev). Turn on with `auth.enabled: true`:
 | Key                   | What it does |
 |-----------------------|--------------|
 | `rate_limit`          | Requests per window, per user (falls back to IP), e.g. `"60/minute"` |
-| `max_upload_mb`       | Reject uploads larger than this. **Also raise `MAX_UPLOAD_MB` in `.env`** — the frontend's nginx rejects bigger bodies before the API sees them, and its own default is 1 MB |
+| `max_upload_mb`       | Reject uploads larger than this. **Also raise `MAX_UPLOAD_MB` in `.env`** — Caddy rejects bigger bodies before the API sees them |
 | `max_files_per_user`  | Files you may currently store (default **10**). `DELETE /ingest/files/{id}` frees a slot |
 | `cors_origins` / `cors_methods` / `cors_headers` | Restrict cross-origin access |
 

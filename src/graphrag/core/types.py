@@ -93,3 +93,8 @@ class QueryResult:
     answer: str
     sources: list[RetrievedChunk] = field(default_factory=list)
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    # What this one question cost, prompt side included. Zero when nothing
+    # metered the run (the CLI, or a caller that passed no meter) — never a
+    # claim that the run was free.
+    input_tokens: int = 0
+    output_tokens: int = 0

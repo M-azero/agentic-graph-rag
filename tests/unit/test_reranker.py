@@ -29,7 +29,7 @@ class _FakeLLM:
 @pytest.fixture
 def build(monkeypatch):
     def _build(by_doc: dict[str, str], **cfg_kwargs):
-        monkeypatch.setattr(rr, "build_chat_model", lambda *a, **k: _FakeLLM(by_doc))
+        monkeypatch.setattr(rr, "build_chat_chain", lambda *a, **k: _FakeLLM(by_doc))
         cfg = RerankCfg(provider="ollama", model="fake-model", **cfg_kwargs)
         return rr.build_reranker(cfg, Secrets())
 
@@ -82,7 +82,7 @@ def test_ollama_defaults_to_reasoning_off(monkeypatch):
         captured.update(kwargs)
         return _FakeLLM({})
 
-    monkeypatch.setattr(rr, "build_chat_model", _capture)
+    monkeypatch.setattr(rr, "build_chat_chain", _capture)
     rr.build_reranker(RerankCfg(provider="ollama", model="m"), Secrets())
     assert captured["extra"]["reasoning"] is False
 
@@ -94,8 +94,71 @@ def test_explicit_reasoning_is_not_overridden(monkeypatch):
         captured.update(kwargs)
         return _FakeLLM({})
 
-    monkeypatch.setattr(rr, "build_chat_model", _capture)
+    monkeypatch.setattr(rr, "build_chat_chain", _capture)
     rr.build_reranker(
         RerankCfg(provider="ollama", model="m", extra={"reasoning": True}), Secrets()
     )
     assert captured["extra"]["reasoning"] is True
+
+
+# --- failover, and what it means for the closed-domain gate ------------------
+#
+# `retrieval.min_relevance` refuses any question whose best chunk scores below
+# it, on the *reranker's* scale. So losing the reranker doesn't just worsen
+# ordering — it decides whether questions get answered at all.
+
+
+class _Boom(rr.Reranker):
+    def rerank(self, query, chunks, top_k):
+        raise RuntimeError("rerank endpoint down")
+
+
+class _Fixed(rr.Reranker):
+    def __init__(self, score: float) -> None:
+        self.score = score
+
+    def rerank(self, query, chunks, top_k):
+        return rr._mark(
+            [
+                rr.RetrievedChunk(
+                    chunk_id=c.chunk_id, text=c.text, source=c.source,
+                    score=self.score, retriever=c.retriever, metadata=c.metadata,
+                )
+                for c in chunks[:top_k]
+            ],
+            True,
+        )
+
+
+def test_failover_uses_the_next_reranker(make_chunk):
+    chain = rr.FallbackReranker([_Boom(), _Fixed(0.8)], ["dead", "backup"])
+    out = chain.rerank("q", [make_chunk("c1")], top_k=1)
+    assert out[0].score == 0.8
+    assert out[0].metadata[rr.CALIBRATED] is True
+
+
+def test_all_rerankers_down_marks_scores_uncalibrated(make_chunk):
+    """The scores that come back are raw retrieval similarities. Letting the
+    0-1 relevance threshold read them would refuse whole conversations for a
+    reason no log would explain."""
+    chain = rr.FallbackReranker([_Boom(), _Boom()], ["a", "b"])
+    out = chain.rerank("q", [make_chunk("c1", score=0.42)], top_k=1)
+    assert out[0].score == 0.42
+    assert out[0].metadata[rr.CALIBRATED] is False
+
+
+def test_noop_reranker_is_never_treated_as_calibrated(make_chunk):
+    out = rr.NoOpReranker().rerank("q", [make_chunk("c1", score=0.9)], top_k=1)
+    assert out[0].metadata[rr.CALIBRATED] is False
+
+
+def test_generative_scores_are_calibrated(build, make_chunk):
+    out = build({"x": "8"}).rerank("q", [make_chunk("c1", "x")], top_k=1)
+    assert out[0].metadata[rr.CALIBRATED] is True
+
+
+def test_generative_reranker_that_scores_nothing_is_uncalibrated(build, make_chunk):
+    """Every scoring call failed, so these are retrieval scores wearing a
+    reranker's name."""
+    out = build({"x": "no idea"}).rerank("q", [make_chunk("c1", "x", score=0.3)], top_k=1)
+    assert out[0].metadata[rr.CALIBRATED] is False

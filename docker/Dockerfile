@@ -61,6 +61,10 @@ COPY pyproject.toml README.md alembic.ini ./
 COPY src ./src
 COPY configs ./configs
 COPY migrations ./migrations
+# The preflight check ships with the image so it can be run where it means
+# something — against the deployed config, from inside the network:
+#   docker compose exec -T api python scripts/preflight.py
+COPY scripts/preflight.py ./scripts/preflight.py
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 
 # Create the non-root user and own the image's paths. `data/` is owned at

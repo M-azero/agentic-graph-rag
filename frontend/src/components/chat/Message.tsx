@@ -27,10 +27,10 @@ function SafetyBanner({ safety }: { safety: SafetyInfo }) {
   return (
     <div
       className={clsx(
-        "mb-2 flex items-start gap-2 rounded-md px-3 py-2 text-[13px]",
+        "mb-2 flex items-start gap-2 rounded-md px-3 py-2 text-sm",
         safety.action === "block"
           ? "bg-danger/10 text-danger"
-          : "bg-amber-500/10 text-amber-600 dark:text-amber-400",
+          : "bg-caution/10 text-caution",
       )}
     >
       <ShieldAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
@@ -62,7 +62,7 @@ export function Message({ turn }: { turn: Turn }) {
   if (isUser) {
     return (
       <div className="flex justify-end">
-        <div className="max-w-[85%] rounded-xl rounded-br-sm bg-accent px-3.5 py-2.5 text-[15px] leading-relaxed text-accent-text">
+        <div className="max-w-[85%] rounded-xl rounded-br-sm bg-accent px-3.5 py-2.5 text-base leading-relaxed text-accent-text">
           <p className="whitespace-pre-wrap">{turn.content}</p>
         </div>
       </div>
@@ -79,7 +79,7 @@ export function Message({ turn }: { turn: Turn }) {
 
       <div className="min-w-0 flex-1">
         {waiting && (
-          <div className="flex items-center gap-2 text-[13px] text-muted">
+          <div className="flex items-center gap-2 text-sm text-muted">
             <Spinner className="h-3 w-3" />
             <span>
               {turn.activity
@@ -97,7 +97,7 @@ export function Message({ turn }: { turn: Turn }) {
         {turn.error && (
           <p
             className={clsx(
-              "rounded-md bg-danger/10 px-3 py-2 text-[13px] text-danger",
+              "rounded-md bg-danger/10 px-3 py-2 text-sm text-danger",
               turn.content && "mt-3",
             )}
           >

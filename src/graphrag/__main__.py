@@ -186,6 +186,32 @@ def promote_admin(email: str) -> None:
 
 
 @app.command()
+def unlock(email: str) -> None:
+    """Clear a login lockout on an account.
+
+    The break-glass for the case the admin panel cannot fix: the locked-out
+    account is the only admin, so there is nobody left who can sign in to
+    unlock it. `GRAPHRAG_ADMIN_KEY` bypasses login entirely but only as a
+    header, which cannot drive the cookie-based console.
+    """
+    from graphrag.container import Container
+
+    container = Container()
+    engine, accounts, _keys = _accounts(container)
+
+    async def _unlock() -> bool:
+        user = await accounts.get_by_email(email)
+        ok = await accounts.unlock(str(user.id)) if user is not None else False
+        await engine.dispose()
+        return ok
+
+    if not _run(_unlock()):
+        typer.echo(f"No account for {email}.")
+        raise typer.Exit(1)
+    typer.echo(f"{email} can sign in again.")
+
+
+@app.command()
 def serve(host: str = "0.0.0.0", port: int = 8000, reload: bool = False) -> None:
     """Start the API server."""
     import uvicorn

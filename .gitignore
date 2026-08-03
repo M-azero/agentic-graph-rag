@@ -16,6 +16,13 @@ dist/
 .env.bak
 .env.*.local
 
+# Personal / deployment-specific notes. This repo is public: the docs teach how
+# to self-host the system, and nothing here should identify where *this* copy of
+# it runs. Untracked alone isn't enough — one `git add .` publishes it.
+ONBOARDING.md
+NOTES.md
+notes/
+
 # Data & models
 # Ignore ingested/uploaded content, but ship the sample corpus the README's
 # quickstart ingests — without it, `graphrag ingest data/sample.md` fails on a
@@ -28,9 +35,13 @@ data/*
 models/
 *.log
 
-# Frontend
+# Web apps. The lockfiles ARE tracked: `npm ci` (used by CI and by the proxy
+# image build) needs them, and without one the image ships a dependency tree
+# nobody tested.
 frontend/node_modules/
 frontend/dist/
+admin/node_modules/
+admin/dist/
 
 # OS / editor
 .DS_Store

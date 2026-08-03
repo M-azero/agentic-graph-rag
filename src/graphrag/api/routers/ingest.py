@@ -28,6 +28,8 @@ from graphrag.api.schemas import (
 )
 from graphrag.container import Container
 from graphrag.core.logging import get_logger
+from graphrag.core.net import BlockedURLError, open_public_url
+from graphrag.core.redact import safe_detail
 from graphrag.db.engine import session_scope
 from graphrag.db.models import File
 from graphrag.jobs import JobStatus, JobStore
@@ -66,16 +68,37 @@ def _inproc_ingest(
     max_chunks: int | None = None,
 ) -> None:
     """Run the pipeline and record the outcome. Blocking — call it off the loop."""
-    store.set(JobStatus(job_id, status="running"))
+    store.set(JobStatus(job_id, status="running", owner=user_id))
     try:
         stats = IngestPipeline(container, max_chunks=max_chunks).run(path, user_id=user_id)
+        # "partial" when the text is searchable but the knowledge graph is not:
+        # extraction failed for at least one chunk. Reporting that as "done"
+        # hands the user an empty graph and no reason for it.
+        detail = ""
+        if stats.partial:
+            detail = (
+                f"Stored and searchable, but entity extraction failed for "
+                f"{stats.extraction_failures} of {stats.chunks} chunks — the "
+                "knowledge graph is incomplete. Check the model provider, then "
+                "re-upload to fill it in."
+            )
+            log.warning(
+                "ingest_partial", job=job_id,
+                failures=stats.extraction_failures, chunks=stats.chunks,
+            )
         store.set(
-            JobStatus(job_id, status="done", documents=stats.documents, chunks=stats.chunks,
-                      entities=stats.entities, relations=stats.relations)
+            JobStatus(job_id, status="partial" if stats.partial else "done",
+                      detail=detail,
+                      documents=stats.documents, chunks=stats.chunks,
+                      entities=stats.entities, relations=stats.relations,
+                      owner=user_id)
         )
     except Exception as exc:
+        # Full error to the log, a scrubbed one to the client: provider SDKs put
+        # the request URL in the message, and for some providers the key rides
+        # in that URL as a query parameter.
         log.warning("ingest_job_failed", job=job_id, error=str(exc))
-        store.set(JobStatus(job_id, status="error", detail=str(exc)))
+        store.set(JobStatus(job_id, status="error", detail=safe_detail(exc), owner=user_id))
 
 
 async def _run_ingest(
@@ -103,7 +126,11 @@ async def _finalize_file(db, file_id: str | None, status: JobStatus | None) -> N
                 sql_update(File)
                 .where(File.id == file_id)
                 .values(
-                    status="ingested" if status.status == "done" else "error",
+                    # A partial ingest stored its chunks and they are
+                    # searchable — only the graph is thin. Marking the file
+                    # "error" would tell the user to re-upload a document that
+                    # is in fact working.
+                    status="ingested" if status.status in ("done", "partial") else "error",
                     chunks=getattr(status, "chunks", 0) or 0,
                 )
             )
@@ -117,7 +144,7 @@ async def _enqueue(
     max_chunks: int | None = None, db=None, file_id: str | None = None,
 ) -> IngestResponse:
     job_id = uuid.uuid4().hex[:12]
-    store.set(JobStatus(job_id, status="queued"))
+    store.set(JobStatus(job_id, status="queued", owner=user_id))
     arq = getattr(request.app.state, "arq", None)
     if arq is not None:
         await arq.enqueue_job("ingest_task", job_id, path, user_id)
@@ -209,7 +236,8 @@ async def ingest_upload(
 
     data = await file.read()
     # The per-file cap is the smaller of the server ceiling and the user's own
-    # allowance, so raising one user's quota can't exceed what nginx will pass.
+    # allowance, so raising one user's quota can't exceed what the proxy passes
+    # (MAX_UPLOAD_MB, enforced by Caddy before the request reaches here).
     per_file_mb = min(api.max_upload_mb, limits.max_file_mb)
     if len(data) > per_file_mb * 1024 * 1024:
         raise HTTPException(status_code=413, detail=f"File exceeds {per_file_mb} MB limit")
@@ -288,19 +316,28 @@ async def delete_file(
 
 
 def _fetch_url(url: str, max_bytes: int) -> Path:
-    """Download a document into data/downloads with a size cap."""
+    """Download a document into data/downloads with a size cap.
+
+    The destination is checked by address, not by scheme: the fetched bytes
+    become a document the caller can then query, so an unchecked URL here is a
+    read primitive aimed at this deployment's own network — the cloud metadata
+    service included. See `graphrag.core.net`.
+    """
     parsed = urllib.parse.urlparse(url)
-    if parsed.scheme not in ("http", "https"):
-        raise HTTPException(status_code=400, detail="Only http(s) URLs can be ingested")
-    req = urllib.request.Request(url, headers={"User-Agent": "graphrag-ingest"})
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310 — scheme checked
+        with open_public_url(url, timeout=30) as resp:
             data = resp.read(max_bytes + 1)
             ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip()
+    except BlockedURLError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Could not fetch URL: {exc}") from exc
+        # Scrubbed: the caller chose the URL, but the failure text can carry
+        # more of this server's internals than they asked about.
+        raise HTTPException(
+            status_code=400, detail=f"Could not fetch URL: {safe_detail(exc, 160)}"
+        ) from exc
     if len(data) > max_bytes:
         raise HTTPException(status_code=413, detail="Remote document exceeds the upload limit")
 
@@ -348,8 +385,20 @@ async def ingest_path(
 
 
 @router.get("/ingest/{job_id}", response_model=IngestStatus)
-def ingest_status(job_id: str, store: JobStore = Depends(get_job_store)) -> IngestStatus:
-    job = store.get(job_id)
+def ingest_status(
+    job_id: str,
+    user: AuthUser = Depends(get_current_user),
+    store: JobStore = Depends(get_job_store),
+) -> IngestStatus:
+    """Progress of one of *your* ingests.
+
+    Scoped, and authenticated: without both, a job id is a bearer token by
+    accident — 48 bits of uuid4 that names how much of someone's document was
+    ingested, and on failure why. A job belonging to anyone else is reported as
+    unknown rather than forbidden, so the response cannot be used to tell real
+    ids from invented ones.
+    """
+    job = store.get(job_id, owner=user.tenant_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Unknown job id")
-    return IngestStatus(**job.to_dict())
+    return IngestStatus(**job.public())
