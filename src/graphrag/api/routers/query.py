@@ -22,13 +22,17 @@ from graphrag.api.schemas import (
 )
 from graphrag.api.streaming import sse_answer, sse_message, sse_refusal
 from graphrag.container import Container
+from graphrag.core.logging import get_logger
 from graphrag.db.engine import session_scope
 from graphrag.db.models import Message, Thread
 from graphrag.limits import enforce_message_limits
 from graphrag.llm.registry import resolve_model
 from graphrag.pipelines import QueryService
+from graphrag.retrieval.reranker import CALIBRATED
+from graphrag.usage import estimate_tokens, record_answer_tokens
 
 router = APIRouter(tags=["query"])
+log = get_logger(__name__)
 
 # Bound what the output guard sees: the groundedness check only needs the
 # retrieved evidence, and forwarding the whole corpus would be slow and could
@@ -68,6 +72,23 @@ def _response(answer: str, sources, tool_calls, safety: SafetyInfo | None = None
         tool_calls=[ToolCall(**tc) for tc in tool_calls],
         safety=safety,
     )
+
+
+def _gate_applies(probe) -> bool:
+    """May `retrieval.min_relevance` be compared against these scores?
+
+    The threshold is calibrated on the reranker's relevance scale. When every
+    reranker in the chain is down the scores are raw retrieval similarities on
+    a different scale entirely, and comparing them would refuse whole
+    conversations — or admit everything — for a reason no log would explain.
+    So a degraded reranker suspends the gate: answering with citations from the
+    best available chunks is the better failure, and the retrieval itself is
+    unaffected.
+    """
+    if probe[0].metadata.get(CALIBRATED, True):
+        return True
+    log.warning("relevance_gate_bypassed", reason="reranker degraded")
+    return False
 
 
 def _chat_model(container: Container, requested: str | None):
@@ -173,7 +194,7 @@ async def query(
     min_rel = container.settings.retrieval.min_relevance
     if min_rel > 0:
         probe = service.search(req.question, user_id=user.tenant_id)
-        if not probe or probe[0].score < min_rel:
+        if not probe or (_gate_applies(probe) and probe[0].score < min_rel):
             await _save_turn(db, thread_id, req.question, CLOSED_DOMAIN_REFUSAL, [], model_name)
             if stream:
                 return EventSourceResponse(sse_message(CLOSED_DOMAIN_REFUSAL))
@@ -204,6 +225,13 @@ async def query(
         user_id=user.tenant_id, model=model,
     )
     answer, sources, tool_calls = result.answer, result.sources, result.tool_calls
+    # Read off the run, not the final text: the agent's tool loop resends the
+    # whole prompt every turn, so the visible answer is a small fraction of what
+    # the question actually cost. Captured before the guard can swap the text —
+    # the model has already run, and billing the refusal that replaces a blocked
+    # answer would make the most expensive requests the cheapest ones.
+    billable_in = result.input_tokens
+    billable = result.output_tokens or estimate_tokens(answer)
 
     # Guardrails output check — the non-streaming path can enforce fully: block
     # (withhold the answer) or redact (swap in the sanitized, PII-clean text).
@@ -219,6 +247,12 @@ async def query(
             answer = v_out.sanitized_output
         safety = _safety_info(v_out, "output")
 
+    await record_answer_tokens(
+        getattr(request.app.state, "usage", None), container.redis,
+        tenant_id=user.tenant_id, account_id=user.user_id,
+        tokens=billable, input_tokens=billable_in,
+        meta={"style": req.style, "stream": False},
+    )
     await _save_turn(db, thread_id, req.question, answer, sources, model_name)
     return _response(answer, sources, tool_calls, safety)
 
@@ -226,6 +260,7 @@ async def query(
 @router.post("/compare", response_model=QueryResponse)
 async def compare(
     req: CompareRequest,
+    request: Request,
     service: QueryService = Depends(get_query_service),
     container: Container = Depends(get_container),
     user: AuthUser = Depends(enforce_message_limits),
@@ -247,7 +282,7 @@ async def compare(
     min_rel = container.settings.retrieval.min_relevance
     if min_rel > 0:
         probe = service.search(question, user_id=user.tenant_id)
-        if not probe or probe[0].score < min_rel:
+        if not probe or (_gate_applies(probe) and probe[0].score < min_rel):
             return _response(CLOSED_DOMAIN_REFUSAL, [], [])
 
     result = await service.aanswer(
@@ -255,6 +290,9 @@ async def compare(
         model=_chat_model(container, req.model),
     )
     answer, sources, tool_calls = result.answer, result.sources, result.tool_calls
+    # Before the guard can replace the text; see the note in `query` above.
+    billable_in = result.input_tokens
+    billable = result.output_tokens or estimate_tokens(answer)
 
     safety = None
     if guard.enabled:
@@ -265,4 +303,13 @@ async def compare(
             answer = v_out.sanitized_output
         safety = _safety_info(v_out, "output")
 
+    # /compare never streams, so it was the other half of the unmetered path —
+    # and it composes a table over several subjects, making it the *more*
+    # expensive of the two per call.
+    await record_answer_tokens(
+        getattr(request.app.state, "usage", None), container.redis,
+        tenant_id=user.tenant_id, account_id=user.user_id,
+        tokens=billable, input_tokens=billable_in,
+        meta={"style": req.style, "stream": False, "endpoint": "compare"},
+    )
     return _response(answer, sources, tool_calls, safety)

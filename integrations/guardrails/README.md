@@ -164,7 +164,7 @@ GUARD_LLM_PROVIDER=openai
 GUARD_LLM_API_KEY=sk-...                # or export OPENAI_API_KEY
 GUARD_LLM_MODEL=gpt-4o-mini             # required (no preset default)
 
-# D) Local & free with Ollama  (see §5.3)
+# D) Local & free with Ollama  (see §5.4)
 GUARD_LLM_PROVIDER=ollama
 GUARD_LLM_MODEL=llama3.1
 ```
@@ -178,13 +178,72 @@ GUARD_LLM_MODEL=llama3.1
 | `gemini` | `gemini-2.5-flash` | `GEMINI_API_KEY` | OpenAI-compat endpoint. |
 | `deepseek` | `deepseek-chat` | `DEEPSEEK_API_KEY` | |
 | `qwen` | `qwen-plus` | `DASHSCOPE_API_KEY` | |
+| `cohere` | `command-a-03-2025` | `COHERE_API_KEY` | OpenAI-compat endpoint (`/compatibility/v1`, not `/v1`). |
 | `groq` / `together` | *(required)* | `GROQ_API_KEY` / `TOGETHER_API_KEY` | |
-| `ollama` | `llama3.1` | — (none needed) | Fully offline & free (§5.3). |
+| `ollama` | `llama3.1` | — (none needed) | Fully offline & free (§5.4). |
 | `vllm` | *(required)* | — | Local; set `GUARD_LLM_BASE_URL`. |
 | `custom` | *(required)* | optional | Any OpenAI-compat URL via `GUARD_LLM_BASE_URL`. |
 | `mock` | `mock-1` | — | Deterministic, offline; drives the tests. |
 
-### 5.3 Running the judge locally & free with Ollama
+### 5.3 Judge failover — because this server fails open
+
+The default `fail_mode` is `flag`, and `open` is a common choice: both mean that
+when the judge stops answering, **requests pass unscreened**. Nothing raises.
+`/health` stays `ok`, verdicts keep returning 200, and the only trace is a
+`judge_unavailable` category in a response nobody reads. One provider is
+therefore a single point of failure for your safety layer.
+
+`GUARD_LLM_FALLBACKS` is a comma-separated list of judges tried in order after
+the primary:
+
+```bash
+GUARD_LLM_PROVIDER=deepseek
+GUARD_LLM_MODEL=deepseek-v4-flash
+GUARD_LLM_FALLBACKS=cohere:command-a-03-2025,gemini:gemini-2.5-flash
+```
+
+Entry syntax is `provider[:model][@base_url]` — omit the model to take the
+preset's default, and append an `http(s)` URL to override the endpoint (two of
+your own deployments: `custom:m@https://a/v1,custom:m@https://b/v1`).
+
+**Put the links on different vendors.** A second model at the same vendor
+shares the key and the outage, so it covers a model being rate-limited or
+withdrawn but not the failure you are actually insuring against. Each link
+resolves its key from that preset's own env var (`COHERE_API_KEY`,
+`GEMINI_API_KEY`, …) rather than from `GUARD_LLM_API_KEY`, which belongs to the
+primary — handing one vendor's token to another doesn't fail loudly, it 401s on
+every request while looking configured. A link with no key is dropped at
+startup and named in the log:
+
+```bash
+curl -s localhost:8080/health | jq .chain
+# ["deepseek:deepseek-v4-flash","cohere:command-a-03-2025","gemini:gemini-2.5-flash"]
+```
+
+Failover covers malformed verdicts too, not just transport errors: a model that
+answers 200 with prose gets one repair retry, then the chain moves on. That
+matters because it is the failure mode you cannot see — the endpoint is healthy,
+the latency is normal, and no verdict is ever produced.
+
+| Var | Default | Meaning |
+|---|---|---|
+| `GUARD_LLM_FALLBACKS` | *(none)* | `provider:model,…` tried after the primary. |
+| `GUARD_LLM_TOTAL_TIMEOUT_S` | *(none)* | Ceiling for one verdict across the **whole** chain, including the repair retry. |
+| `GUARD_LLM_FAILOVER_MAX_FAILURES` | `2` | Consecutive failures that park a link. |
+| `GUARD_LLM_FAILOVER_COOLDOWN_S` | `300` | How long a parked link stays out. |
+
+Set `GUARD_LLM_TOTAL_TIMEOUT_S` whenever you configure fallbacks. Without it the
+budget is per-link, so three links at `GUARD_LLM_TIMEOUT_S=10` can run for 30 s
+— long past the point your caller timed out and failed open, leaving the chain
+burning tokens on a verdict nobody will read. A parked link is still tried when
+every other link is down too: a five-minute-old guess about a provider should
+not be the reason nothing gets screened.
+
+Pick links by **testing** them, especially on groundedness. Models that flag
+prompt injection perfectly will score a flatly contradicted answer as grounded,
+and the verdict is well-formed either way, so nothing looks wrong.
+
+### 5.4 Running the judge locally & free with Ollama
 
 No API bills, nothing leaves your machine:
 
@@ -203,7 +262,7 @@ guardrails-server
 To override the endpoint (remote Ollama, or the `vllm`/`custom` presets), set
 `GUARD_LLM_BASE_URL=http://host:11434/v1`.
 
-### 5.4 The rest of the environment (server & defaults)
+### 5.5 The rest of the environment (server & defaults)
 
 | Var | Default | Meaning |
 |---|---|---|
@@ -336,10 +395,17 @@ guardrails/
     pii.py            Secrets (API keys, JWTs, private keys) + PII (email, SSN, cards via
                       Luhn, IBAN, phone) detection and redaction.
   judge/
-    providers.py      Anthropic / OpenAI-compat / Mock backends + the preset table.
+    providers.py      Anthropic / OpenAI-compat / Mock backends, the preset table, and
+                      the fallback-chain builder (§5.3).
     prompts.py        Nonce-armored judge prompts (see §9), JSON verdict schemas, few-shots.
-    judge.py          Calls a provider, parses/repairs the JSON, clamps scores.
+    judge.py          Walks the provider chain; per link: call, parse/repair the JSON,
+                      clamp scores. Circuit breaker + overall deadline live here.
 ```
+
+Failover sits in `judge.py` rather than behind the provider interface on
+purpose. A model that answers 200 with prose fails in the *parser*, not in
+`complete()` — so a provider-level wrapper would miss exactly the link that
+looks healthiest while producing no verdict at all.
 
 One input request, end to end:
 
@@ -404,9 +470,9 @@ tests never make a live API call and never cost anything.
 | Symptom | Fix |
 |---|---|
 | "My API key is ignored." | You probably have no `.env` — `cp .env.example .env` and edit it (§5.1). Restart after editing. |
-| Can't reach the server from another machine. | It binds to `127.0.0.1` by default. Set `GUARD_HOST=0.0.0.0` (§5.4). |
+| Can't reach the server from another machine. | It binds to `127.0.0.1` by default. Set `GUARD_HOST=0.0.0.0` (§5.5). |
 | `/docs` returns 404. | Intentional — set `GUARD_ENABLE_DOCS=true` to expose the interactive docs. |
-| Ollama errors. | Confirm `ollama pull <model>` and that `GUARD_LLM_MODEL` matches it exactly (§5.3). |
+| Ollama errors. | Confirm `ollama pull <model>` and that `GUARD_LLM_MODEL` matches it exactly (§5.4). |
 | Every request returns `flag` when the model is down. | That's `GUARD_FAIL_MODE=flag` working; set `open`/`closed` to change it. |
 
 ---

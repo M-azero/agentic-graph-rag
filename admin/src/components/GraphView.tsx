@@ -8,7 +8,7 @@ import {
 } from "d3-force";
 import { useEffect, useMemo, useRef, useState } from "react";
 
-import type { GraphSample } from "../../api";
+import type { GraphSample } from "../api";
 
 interface Node extends SimulationNodeDatum {
   key: string;
@@ -60,7 +60,7 @@ export function GraphView({ sample }: { sample: GraphSample }) {
 
   if (!sample.nodes.length) {
     return (
-      <p className="py-12 text-center text-[13px] text-muted">
+      <p className="py-12 text-center text-sm text-muted">
         No entities extracted yet.
       </p>
     );

@@ -86,12 +86,20 @@ export function RequireAuth({ children }: { children: ReactNode }) {
   return <>{children}</>;
 }
 
-export function RequireAdmin({ children }: { children: ReactNode }) {
-  const { me, loading } = useAuth();
-
-  if (loading) return <Loading />;
-  if (!me) return <Navigate to="/login" replace />;
-  // Send non-admins to chat rather than showing a locked page they can't use.
-  if (me.role !== "admin") return <Navigate to="/chat" replace />;
-  return <>{children}</>;
+/**
+ * Where to send someone after signing in.
+ *
+ * `?next=` takes precedence over the remembered location because it is how the
+ * admin console hands off: it lives at /admin in a *different* bundle, so a
+ * 401 there leaves this app entirely and comes back with `?next=/admin/`.
+ *
+ * Only same-origin paths are honoured. Without that check, `?next=https://…`
+ * turns the login page into an open redirect — a phisher links to the real
+ * sign-in form and collects the user on the way out.
+ */
+export function safeNext(search: string): string | null {
+  const next = new URLSearchParams(search).get("next");
+  if (!next) return null;
+  if (!next.startsWith("/") || next.startsWith("//")) return null;
+  return next;
 }

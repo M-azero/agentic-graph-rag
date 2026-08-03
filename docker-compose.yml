@@ -5,8 +5,8 @@
 #   postgres  accounts, limits, usage, chat history, agent memory
 #   redis     cache / rate-limit counters / job status
 #   api       FastAPI service             http://localhost:8000  (docs at /docs)
-#   frontend  React chat UI               http://localhost:5173
-#   proxy     TLS termination             the public entrypoint (80/443)
+#   proxy     TLS + both web apps + /api  the public entrypoint (80/443)
+#             chat UI at /, admin console at /admin
 #   worker    ingest queue worker (Arq)   profile: worker  — see note below
 #   ollama    local models                profile: local
 #
@@ -170,17 +170,6 @@ services:
       resources:
         limits: { cpus: "${WORKER_CPU_LIMIT:-1}", memory: "${WORKER_MEM_LIMIT:-1g}" }
 
-  frontend:
-    build: { context: ./frontend }
-    restart: unless-stopped
-    # Loopback only; from other devices use the proxy (80/443).
-    ports: ["127.0.0.1:5173:80"]
-    depends_on:
-      api: { condition: service_healthy }
-    deploy:
-      resources:
-        limits: { cpus: "${FRONTEND_CPU_LIMIT:-0.5}", memory: "${FRONTEND_MEM_LIMIT:-64m}" }
-
   ollama:
     image: ollama/ollama:latest
     restart: unless-stopped
@@ -193,26 +182,46 @@ services:
       resources:
         limits: { cpus: "${OLLAMA_CPU_LIMIT:-4}", memory: "${OLLAMA_MEM_LIMIT:-8g}" }
 
-  # TLS termination + reverse proxy. This is the public entrypoint (80/443) —
-  # every other published port above is bound to 127.0.0.1, so from the network
-  # only the proxy exists.
+  # TLS, static hosting for both web apps, and the API reverse proxy. This is
+  # the public entrypoint (80/443) — every other published port above is bound
+  # to 127.0.0.1, so from the network only the proxy exists.
+  #
+  # It is built rather than pulled because the image carries the built SPAs:
+  # `docker compose up -d --build proxy` after a UI change.
   proxy:
-    image: caddy:2-alpine
+    build: { context: ., dockerfile: docker/Dockerfile.proxy }
     restart: unless-stopped
     environment:
       SITE_ADDRESS: ${SITE_ADDRESS:-:80}   # -> localhost or a domain to enable HTTPS
       TLS_EMAIL: ${TLS_EMAIL:-}
+      # Caddy refuses bodies above this before they reach the API. Keep it >=
+      # api.max_upload_mb in configs/*.yaml.
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-25}
     ports: ["80:80", "443:443"]
     volumes:
+      # Bind-mounted as well as baked into the image, so fixing the config that
+      # is the only way into the deployment is a restart, not a rebuild.
       - ./docker/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data           # persisted certs
       - caddy_config:/config
     depends_on:
       api: { condition: service_healthy }
-      frontend: { condition: service_started }
     deploy:
       resources:
         limits: { cpus: "${PROXY_CPU_LIMIT:-0.5}", memory: "${PROXY_MEM_LIMIT:-128m}" }
+    healthcheck:
+      # Caddy's local admin API, not the site: with a real SITE_ADDRESS the site
+      # redirects :80 to HTTPS and a plain wget fails on the certificate name.
+      #
+      # 127.0.0.1, NOT localhost. Caddy binds the admin API to IPv4 only, while
+      # `localhost` inside the container resolves to ::1 first — so the hostname
+      # form gets "connection refused" and the container sits unhealthy forever
+      # while serving traffic perfectly well.
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:2019/config/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
 volumes:
   neo4j_data:

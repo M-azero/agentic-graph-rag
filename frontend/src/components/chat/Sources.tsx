@@ -14,7 +14,7 @@ export function Sources({ sources }: { sources: Source[] }) {
     <div className="mt-3">
       <button
         onClick={() => setOpen((v) => !v)}
-        className="inline-flex items-center gap-1.5 text-[12px] font-medium text-muted transition-colors hover:text-body"
+        className="inline-flex items-center gap-1.5 text-xs font-medium text-muted transition-colors hover:text-body"
         aria-expanded={open}
       >
         <ChevronRight
@@ -28,16 +28,16 @@ export function Sources({ sources }: { sources: Source[] }) {
           {sources.map((s) => (
             <li
               key={s.chunk_id}
-              className="rounded-lg bg-raised/60 p-2.5 ring-1 ring-border/60"
+              className="rounded-lg border border-border bg-raised/60 p-2.5"
             >
               <div className="mb-1 flex items-center gap-2">
                 <FileText className="h-3 w-3 shrink-0 text-muted" />
-                <span className="truncate text-[12px] font-medium text-body">
+                <span className="truncate text-xs font-medium text-body">
                   {fileName(s.source)}
                 </span>
                 <Badge>{s.retriever}</Badge>
               </div>
-              <p className="line-clamp-3 text-[12px] leading-relaxed text-muted">
+              <p className="line-clamp-3 text-xs leading-relaxed text-muted">
                 {s.snippet}
               </p>
             </li>

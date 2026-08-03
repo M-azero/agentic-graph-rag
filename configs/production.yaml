@@ -1,22 +1,58 @@
 # Production profile: cloud APIs only, sized for a small VPS (2 vCPU / 8 GB).
-# No torch, no local models — chat/OCR via Gemini (+ DeepSeek/Qwen selectable),
-# embeddings + rerank via Cohere. Set the matching keys in .env:
-#   GOOGLE_API_KEY     (chat default + OCR)
-#   COHERE_API_KEY     (embeddings + rerank)
-#   DEEPSEEK_API_KEY   (optional chat provider)
-#   DASHSCOPE_API_KEY  (optional chat provider, Qwen)
+# No torch, no local models. Set the matching keys in .env:
+#   DEEPSEEK_API_KEY   (chat + extraction default, rerank fallback)
+#   DEEPINFRA_TOKEN    (chat fallbacks, OCR, rerank fallback, guard judge)
+#   COHERE_API_KEY     (embeddings, rerank, and the third vendor everywhere else)
+#   GOOGLE_API_KEY     (last OCR fallback)
+#
+# EVERY API MODEL HAS A FALLBACK CHAIN. When a provider goes down, has its key
+# revoked, or gets a billing block, the next one in the list serves the request
+# — a failure degrades the deployment rather than stopping it. Two consecutive
+# failures take a provider out of rotation for 5 minutes (a denied key answers
+# in ~200ms, and paying that on every request adds up), and it rejoins on its
+# own once a probe succeeds. `scripts/preflight.py` shows which links are live.
+#
+# CHAINS SPAN VENDORS, NOT JUST MODELS. Depth is not redundancy when every link
+# shares one API key: the outages that actually happen are account-level —
+# billing blocks, revoked keys, a vendor going down — and they take out every
+# model behind that key at once. So each role below reaches at least two, and
+# the roles that can, three. `preflight.py --vendors` prints the spread.
 llm:
-  provider: gemini
-  model: gemini-3.5-flash
+  provider: deepseek
+  model: deepseek-v4-flash
   max_tokens: 4096
+  # Tried in order when the model above fails. All three were verified to make
+  # real tool calls — the agent binds tools, so a model without them cannot
+  # retrieve at all and would answer from thin air. That rules out several
+  # cheaper options (Mistral-Small-24B, phi-4) which have no tool support.
+  #
+  # Link 2 is the SAME MODEL as the primary, reached through a second provider:
+  # if DeepSeek's own API is unreachable or its key is revoked, the agent keeps
+  # behaving identically instead of subtly changing personality mid-incident.
+  # Link 3 is a different vendor on purpose — a fault in DeepSeek's weights or
+  # a bad release is not something a second route to them can save you from.
+  # DeepInfra prices (2026-08): gpt-oss-120b $0.037/$0.17 per 1M in/out,
+  # DeepSeek-V4-Flash $0.09/$0.18.
+  #
+  # Link 4 is the third VENDOR. Links 2 and 3 both live at DeepInfra, so a
+  # DeepInfra outage while DeepSeek is also degraded would take chat down
+  # despite a three-deep chain. Cohere is expensive ($2.50/$10 per 1M) and only
+  # ever fires when both other vendors are gone, which is the point — insurance
+  # that costs nothing until it pays out.
+  fallbacks:
+    - { provider: deepinfra, model: deepseek-ai/DeepSeek-V4-Flash }
+    - { provider: deepinfra, model: openai/gpt-oss-120b }
+    - { provider: cohere,    model: command-a-03-2025 }
   # What the chat UI's model selector may pick. Requests naming anything else
   # fall back to the default. The admin panel can narrow this list further.
+  # A model chosen here still gets the fallback chain above, so picking one
+  # does not opt out of failover.
   allowed:
-    - { provider: gemini,   model: gemini-3.5-flash,      label: "Gemini 3.5 Flash", default: true }
-    - { provider: gemini,   model: gemini-3.1-flash-lite, label: "Gemini Flash Lite" }
-    - { provider: deepseek, model: deepseek-v4-flash,     label: "DeepSeek V4 Flash" }
-    - { provider: qwen,     model: qwen3.6-plus,          label: "Qwen 3.6 Plus" }
-    - { provider: qwen,     model: qwen3.6-flash,         label: "Qwen 3.6 Flash" }
+    - { provider: deepseek,  model: deepseek-v4-flash,             label: "DeepSeek V4 Flash", default: true }
+    - { provider: deepinfra, model: openai/gpt-oss-120b,           label: "GPT-OSS 120B" }
+    - { provider: deepinfra, model: Qwen/Qwen3-235B-A22B-Instruct-2507, label: "Qwen3 235B" }
+    - { provider: deepinfra, model: zai-org/GLM-4.7-Flash,         label: "GLM 4.7 Flash" }
+    - { provider: gemini,    model: gemini-3.5-flash,              label: "Gemini 3.5 Flash" }
 
 embeddings:
   provider: cohere
@@ -25,22 +61,64 @@ embeddings:
   # nearly all retrieval quality at two-thirds the vector storage.
   dimensions: 1024
   tokenizer: BAAI/bge-m3   # HF tokenizer for chunk sizing only (Cohere's isn't on HF)
+  # NO FALLBACK HERE, deliberately. Every other surface degrades to a different
+  # provider; embeddings cannot. A different embedding model puts the same text
+  # somewhere else in vector space, so switching mid-corpus writes vectors that
+  # cannot be compared with the stored ones — ingest silently poisons the index
+  # and queries return nonsense neighbours, with nothing raised anywhere. If
+  # Cohere is down, ingest should fail and be retried. Config rejects a
+  # fallback naming a different model rather than letting this happen quietly.
 
 ocr:
   engine: vision_llm
   vision_llm:
-    provider: gemini
-    model: gemini-3.1-flash-lite
+    # All three verified against an image with known text: a model that ignores
+    # the attachment returns confident prose about nothing, which OCR cannot
+    # tell apart from a blank page — so "advertises vision" is not evidence.
+    # Mistral-Small-3.2 transcribed "1,284.50" exactly where gemma-3-12b
+    # returned "1.284.50"; on documents full of amounts and dates that
+    # difference is the whole job, which is why it leads despite costing more.
+    provider: deepinfra
+    model: mistralai/Mistral-Small-3.2-24B-Instruct-2506
+    # Ordered by measured transcription accuracy within a vendor, then across
+    # vendors. gemma-3-27b covers a per-model fault at DeepInfra (rate limit,
+    # model withdrawn) where a different vendor would be a needless downgrade;
+    # command-a-vision covers DeepInfra itself being gone. It is the only vision
+    # model reachable on a key this deployment already holds — scored 4/6 on the
+    # same known-text image where the DeepInfra pair scored 6/6, so it is a real
+    # step down, and it is placed where that trade is worth making.
+    fallbacks:
+      - { provider: deepinfra, model: google/gemma-3-27b-it }
+      - { provider: cohere,    model: command-a-vision-07-2025 }
+      - { provider: gemini,    model: gemini-3.1-flash-lite }
+  # Last resort when every vision API is unreachable. Tesseract is installed in
+  # the image and needs no key, so scanned documents stay ingestible — less
+  # accurately, but a rough transcription beats an empty page.
+  fallback_engine: tesseract
 
 retrieval:
   rerank:
     provider: cohere
     model: rerank-v4.0-fast
+    # The two fallbacks are THE SAME MODEL reached through two providers, and
+    # that is the point. Reranking feeds `min_relevance` below, which decides
+    # whether a question gets answered at all — so a fallback that scores on a
+    # different curve does not just reorder results, it changes which questions
+    # are refused. Identical weights score identically, so failing from link 2
+    # to link 3 is invisible to the gate. DeepInfra serves no reranker model of
+    # its own (only BGE embeddings), so these two are generative: a chat model
+    # rating each pair 0-10, normalized to 0-1.
+    fallbacks:
+      - { provider: deepseek,  model: deepseek-v4-flash }
+      - { provider: deepinfra, model: deepseek-ai/DeepSeek-V4-Flash }
   # Closed-domain gate: refuse questions the knowledge base doesn't cover instead
   # of answering from the LLM's general knowledge. Calibrated on this corpus with
   # Cohere rerank-v4: in-topic questions score 0.70–0.89, off-topic 0.11–0.20, so
   # 0.5 cleanly rejects off-topic while leaving margin for oblique real questions.
   # Lower it if legitimate questions get refused; raise it to be stricter.
+  # If every reranker in the chain is down the scores are raw retrieval
+  # similarities on a different scale, and the gate suspends itself rather than
+  # compare against them — see `_gate_applies` in the query router.
   min_relevance: 0.5
 
 storage:
@@ -58,22 +136,43 @@ ingestion:
   max_concurrency: 2
 
 # --- Integrated features (see docs/INTEGRATIONS.md) ---------------------------
-# Both need their services up: `make deploy` (or the integrations overlay).
-# In-container URLs come from the compose overlay (guardrails:8080 /
-# llmlens-api:8000), so no base_url/url needs setting here.
 safety:
   enabled: true             # screen every /query & /compare through guardrails
+  # Must outlast a judge FAILOVER, not just a judge call. The guard fails open,
+  # so if this expires while the chain is still working through a dead link,
+  # the request goes out unscreened and the verdict that was about to arrive is
+  # thrown away. Budget: GUARD_LLM_TOTAL_TIMEOUT_S (9s, the judge's own ceiling
+  # across all links) + HTTP and rule-check overhead. The normal path is
+  # unaffected — a healthy judge answers in ~2s and this is only a ceiling.
+  timeout_s: 12.0
 observability:
-  enabled: true             # trace agent runs (tokens, cost, latency) to llmlens
+  # OFF: llmlens is not deployed on this box (it needs ClickHouse + its own
+  # Redis + api/worker, roughly another 4.7 GB, which does not fit alongside
+  # the RAG stack on 8 GB). Turn it on only with the observability profile up.
+  enabled: false
+
+api:
+  # A public deployment should not publish its own API contract. The admin
+  # endpoints are locked either way (fail-closed, 403 without an admin account
+  # or key) — this stops the schema from advertising that they exist, what
+  # they take and what they return. Read the docs on a dev instance, or open an
+  # SSH tunnel to :8000 where the proxy is not in the path.
+  docs_enabled: false
+  # Admin-gated: /metrics maps every route, its traffic and its error rates.
+  # A scraper sends X-Admin-Key, or scrapes the container directly in-network.
+  metrics_public: false
 
 auth:
   enabled: true             # sessions or API keys required; X-User-Id ignored
   open_registration: true   # false -> only an admin can create accounts
   session_ttl_days: 30
-  # auto: the Secure flag follows the request scheme, so HTTPS is protected and
-  # a plain-HTTP deployment still works. Pin to true once TLS is guaranteed.
-  cookie_secure: auto
+  # Pinned on, not `auto`: this deployment is behind Caddy with a real
+  # certificate, so a session cookie has no business travelling without the
+  # Secure flag. `auto` exists for plain-HTTP local runs.
+  # Quoted because the field is tri-state ("auto" | "true" | "false"); bare
+  # YAML true is a bool and fails validation.
+  cookie_secure: "true"
   email:
-    # console logs codes to the server log (dev). Set RESEND_API_KEY or
-    # BREVO_API_KEY and switch this to actually deliver them.
+    # Resend, sending from the verified domain (see docs/DEPLOYMENT.md). With
+    # no provider key the codes are only logged, which no real signup can use.
     provider: resend

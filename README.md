@@ -174,10 +174,11 @@ make up
 docker compose exec api alembic upgrade head   # create the account tables
 ```
 
-The frontend only starts once the API reports healthy (compose waits on a
+The proxy only starts once the API reports healthy (compose waits on a
 healthcheck), so when it's up, the whole stack is up. Then open:
 
-- **Web UI** — http://localhost:5173
+- **Web UI** — http://localhost
+- **Admin console** — http://localhost/admin  (needs an account with the admin role)
 - **API docs (Swagger, test any endpoint here)** — http://localhost:8000/docs
 - **Neo4j browser** — http://localhost:7474
 
@@ -378,8 +379,10 @@ llm:
 
 **Chat** — any Ollama model listing `tools` in `ollama show` (the agent binds
 tools; without them it can't retrieve at all), or an API provider (`anthropic`,
-`openai`, `gemini`). Note `gemma3:4b` has **no** `tools` — fine for OCR, useless
-as the agent.
+`openai`, `gemini`, `deepseek`, `qwen`, `deepinfra`). Note `gemma3:4b` has **no**
+`tools` — fine for OCR, useless as the agent. Every role also takes a
+`fallbacks` list, so one dead key degrades the service instead of stopping it —
+see [docs/PROVIDERS.md](docs/PROVIDERS.md).
 
 **Extraction** — needs to follow instructions well enough to skip notation, which
 is a real bar: on notes full of transition tables, gemma3:4b filled the graph with
@@ -388,7 +391,9 @@ expansion looks like noise, this is the knob.
 
 **Reranking** — the least fussy: it only has to answer with a number. Any chat
 model, `cross_encoder` (faster and better, needs the `local-models` extra),
-`cohere` / `voyage`, or `none`.
+`cohere` / `voyage`, or `none`. Worth knowing before you set it to `none`:
+`retrieval.min_relevance` refuses off-topic questions using the reranker's
+score, so turning reranking off also turns that gate off.
 
 ### A bigger model that doesn't fit is a slower model
 
@@ -518,9 +523,10 @@ src/graphrag/
 └── container.py    Composition root: reads config, builds everything, once
 
 migrations/         Alembic — the Postgres schema, versioned
-frontend/           React + Vite: chat, account, admin dashboard; nginx
+frontend/           React + Vite: the chat app (chat · documents · account)
+admin/              React + Vite: the admin console, a separate app at /admin
 configs/            The YAML profiles — default · production · local · api
-docker/             API image + Caddy reverse-proxy config
+docker/             API image + proxy image (builds both apps) + Caddyfile
 scripts/eval.py     Score retrieval + answers against data/eval/qa.yaml (make eval)
 tests/unit/         Fast, no services needed. Start here to learn the codebase.
 tests/integration/  Against real Postgres — accounts, limits, admin (see below)
@@ -638,7 +644,7 @@ This is built to run as a controllable service, not just a demo. What's in place
   `data/` (an attempt to reach `.env` or any other server file is a 400), and it
   also accepts an http(s) URL, fetched with a size cap. Uploads go through
   `/ingest/upload` regardless. Raising `max_upload_mb` also needs `MAX_UPLOAD_MB`
-  in `.env` raised — nginx rejects oversized bodies before the API sees them.
+  in `.env` raised — Caddy rejects oversized bodies before the API sees them.
 - **Grounded, closed-domain answers.** The assistant answers only from your
   documents. A relevance gate (`retrieval.min_relevance`) refuses questions the
   corpus doesn't cover before the model runs, a strict system prompt forbids
@@ -663,9 +669,16 @@ This is built to run as a controllable service, not just a demo. What's in place
   usage events in Postgres behind the admin charts, and structured request logs.
   A `make eval` target scores retrieval and answers against a golden set
   (`data/eval/qa.yaml`) so retrieval changes are measured, not guessed.
-- **TLS + reverse proxy.** A **Caddy** proxy is the public entrypoint (80/443):
-  it terminates TLS, routes `/api/*` → API and everything else → the UI (and
-  streams SSE). Behind it the UI and API share one origin, so CORS isn't needed.
+- **TLS + reverse proxy.** A single **Caddy** container is the public entrypoint
+  (80/443): it terminates TLS, serves the chat app at `/` and the admin console
+  at `/admin` from static files built into its image, and routes `/api/*` to the
+  API with buffering off so SSE streams. One origin for everything, so CORS isn't
+  needed and one session cookie covers both apps.
+- **Accounts you can actually operate.** Password reset by emailed code, change
+  password, a "signed-in devices" list you can revoke individually, per-IP limits
+  on every unauthenticated auth endpoint, and a failed-login lockout with
+  exponential backoff (`make unlock EMAIL=…` is the break-glass). Admins can
+  invite users, force a password reset, and clear a lockout.
 
 ### Exposing it over HTTPS
 
@@ -680,7 +693,7 @@ The proxy handles certificates automatically — you just set `SITE_ADDRESS`:
 For a public domain: point its DNS A record at the host, set `SITE_ADDRESS` and
 `TLS_EMAIL` in `.env`, and `docker compose up` — Caddy provisions and renews the
 cert on :443 and redirects HTTP→HTTPS. For a real deployment, also remove the
-host `ports` from the `api`/`frontend` services so only the proxy is reachable.
+host `ports` from the `api` service so only the proxy is reachable.
 
 Still on the roadmap: backups and restore drills for Postgres + the per-user
 DuckDB files, distributed tracing, and the quantized ANN backends sketched in
@@ -708,12 +721,18 @@ GRAPHRAG_TEST_DATABASE_URL=postgresql://graphrag:change-me@localhost:5432/graphr
   pytest -m integration -q
 ```
 
-The frontend is a separate build:
+The two web apps are separate builds. Both proxy `/api` to the backend on
+:8000, so run the API alongside them:
 
 ```bash
-cd frontend && npm install && npm run dev   # Vite on :5173, proxying /api to :8000
-npm run build                               # tsc + production bundle
+cd frontend && npm install && npm run dev   # chat app,      Vite on :5173
+cd admin    && npm install && npm run dev   # admin console, Vite on :5174
+npm run build                               # tsc + production bundle (in either)
+make web                                    # or build both at once
 ```
+
+In production neither dev server is involved: `make up` builds both into the
+proxy image, which serves them at `/` and `/admin`.
 
 Design decisions and the reasoning behind them live in
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).

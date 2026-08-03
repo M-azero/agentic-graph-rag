@@ -8,6 +8,12 @@ Run them with a live Postgres (and Redis, optionally):
 
 Each test gets a schema-fresh database: tables are created from the models and
 dropped afterwards, so a failed run cannot poison the next one.
+
+**Run these with `GRAPHRAG_PROFILE=api`** (CI has no `.env`, so it gets that by
+default). A developer `.env` that sets `GRAPHRAG_PROFILE=production` is read by
+`Container()` here too, and the production profile pins `cookie_secure: "true"`
+— httpx then refuses to send the session cookie back over the `http://test`
+base URL and roughly half of these fail with a baffling 401.
 """
 
 from __future__ import annotations
@@ -124,3 +130,21 @@ class CapturingSender:
 @pytest.fixture
 def email_sender() -> CapturingSender:
     return CapturingSender()
+
+
+def relax_auth_limits(container) -> None:
+    """Turn off the per-IP `/auth/*` throttles for a test app.
+
+    These tests drive signup and login dozens of times from one address, which
+    is exactly what the throttle exists to stop. Worse, when a local Redis is
+    reachable the limiter is Redis-backed, so the buckets are shared by every
+    app instance in the run *and* survive between runs — a suite that passed
+    once would then fail for the next ten minutes.
+
+    The throttle itself is covered by `tests/unit/test_auth_ratelimit.py` (which
+    address is counted) and `tests/integration/test_auth_throttle.py` (that the
+    limit fires), so nothing is lost by disabling it here.
+    """
+    limits = container.settings.auth.rate_limits
+    for field in type(limits).model_fields:
+        setattr(limits, field, "")

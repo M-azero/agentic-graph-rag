@@ -81,7 +81,10 @@ class IngestResponse(BaseModel):
 
 class IngestStatus(BaseModel):
     job_id: str
-    status: str  # queued | running | done | error
+    # queued | running | done | partial | error
+    # `partial` = chunks stored and searchable, but graph extraction failed for
+    # some of them, so the knowledge graph is incomplete. `detail` says how many.
+    status: str
     detail: str = ""
     documents: int = 0
     chunks: int = 0
@@ -123,6 +126,40 @@ class EmailRequest(BaseModel):
 class LoginRequest(BaseModel):
     email: str = Field(..., min_length=3, max_length=320)
     password: str = Field(..., min_length=1, max_length=128)
+
+
+class ForgotPasswordRequest(BaseModel):
+    email: str = Field(..., min_length=3, max_length=320)
+
+
+class ResetPasswordRequest(BaseModel):
+    email: str = Field(..., min_length=3, max_length=320)
+    code: str = Field(..., min_length=4, max_length=12)
+    password: str = Field(..., min_length=1, max_length=128)
+
+
+class ChangePasswordRequest(BaseModel):
+    # Length is validated by `validate_password`, not here: a bound of 1 lets
+    # the server return its own "too short" message rather than a 422 the UI
+    # would have to translate.
+    current_password: str = Field(..., min_length=1, max_length=128)
+    new_password: str = Field(..., min_length=1, max_length=128)
+
+
+class SessionInfo(BaseModel):
+    """One signed-in device. `ip` and `user_agent` are shown so a session the
+    user does not recognise is recognisable as such."""
+
+    id: str
+    created_at: str = ""
+    last_seen_at: str | None = None
+    ip: str | None = None
+    user_agent: str | None = None
+    current: bool = False
+
+
+class SessionList(BaseModel):
+    sessions: list[SessionInfo] = []
 
 
 class Acknowledged(BaseModel):
@@ -249,6 +286,11 @@ class AdminUser(BaseModel):
     created_at: str = ""
     last_login_at: str | None = None
     email_verified: bool = False
+    # Lockout state, so the admin table can explain "they can't sign in"
+    # without the admin having to guess.
+    locked_until: str | None = None
+    failed_logins: int = 0
+    password_changed_at: str | None = None
     files: int = 0
     threads: int = 0
     messages_30d: int = 0
@@ -270,6 +312,15 @@ class AdminUserDetail(BaseModel):
     storage_used_mb: float = 0.0
     graph: dict[str, int] = {}
     files: list[StoredFile] = []
+
+
+class AdminUserCreate(BaseModel):
+    """Invite an account into existence. No password field on purpose — the
+    invitee sets their own via the emailed code, so no secret is ever typed by
+    one person on behalf of another."""
+
+    email: str = Field(..., min_length=3, max_length=320)
+    role: str = Field("user", description="user | admin")
 
 
 class UserPatch(BaseModel):
@@ -372,3 +423,6 @@ class Ready(BaseModel):
     ready: bool
     neo4j: bool
     redis: bool
+    # Accounts, limits, usage, chat history. Gates `ready` only when auth is on;
+    # reported either way so a probe shows the state without acting on it.
+    database: bool = False

@@ -35,6 +35,14 @@ class IngestStats:
     entities: int = 0
     relations: int = 0
     files: list[str] = field(default_factory=list)
+    # Chunks whose extraction call failed outright (provider down, key denied).
+    # The vectors for those chunks are stored and searchable; only their graph
+    # structure is missing, which is why this is "partial" and not a failure.
+    extraction_failures: int = 0
+
+    @property
+    def partial(self) -> bool:
+        return self.extraction_failures > 0
 
 
 class LimitExceededError(RuntimeError):
@@ -120,14 +128,19 @@ class IngestPipeline:
         with ThreadPoolExecutor(max_workers=workers) as pool:
             extracted = list(pool.map(self._c.extractor.extract, [c.text for c in chunks]))
 
-        for chunk, (entities, relations) in zip(chunks, extracted, strict=True):
-            if not entities:
+        for chunk, result in zip(chunks, extracted, strict=True):
+            if result.failed:
+                stats.extraction_failures += 1
                 continue
-            tenant.graph_store.add_entities(entities)
-            tenant.graph_store.add_relations(relations)
-            tenant.graph_store.link_chunk_entities(chunk.id, [e.key for e in entities])
-            stats.entities += len(entities)
-            stats.relations += len(relations)
+            if not result.entities:
+                continue
+            tenant.graph_store.add_entities(result.entities)
+            tenant.graph_store.add_relations(result.relations)
+            tenant.graph_store.link_chunk_entities(
+                chunk.id, [e.key for e in result.entities]
+            )
+            stats.entities += len(result.entities)
+            stats.relations += len(result.relations)
 
     def _enrich(self, tenant: Tenant) -> None:
         cfg = self._c.settings.ingestion

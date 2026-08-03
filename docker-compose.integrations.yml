@@ -49,6 +49,25 @@ services:
       GUARD_LLM_BASE_URL: ${GUARD_LLM_BASE_URL:-http://host.docker.internal:11434/v1}
       GUARD_LLM_TIMEOUT_S: ${GUARD_LLM_TIMEOUT_S:-60}
       GUARD_API_KEY: ${GUARD_API_KEY:-}                 # match GRAPHRAG_GUARDRAILS_API_KEY
+      # Judge failover ("provider:model,provider:model"). The guard fails OPEN,
+      # so a single dead judge does not error — it silently stops screening.
+      GUARD_LLM_FALLBACKS: ${GUARD_LLM_FALLBACKS:-}
+      GUARD_LLM_TOTAL_TIMEOUT_S: ${GUARD_LLM_TOTAL_TIMEOUT_S:-}
+      GUARD_LLM_FAILOVER_MAX_FAILURES: ${GUARD_LLM_FAILOVER_MAX_FAILURES:-2}
+      GUARD_LLM_FAILOVER_COOLDOWN_S: ${GUARD_LLM_FAILOVER_COOLDOWN_S:-300}
+      # This service has NO env_file (deliberately — it should not see the RAG
+      # stack's whole secret set), so every fallback link's native key has to
+      # be listed here or the link is dropped at startup. GUARD_LLM_API_KEY is
+      # not a substitute: it belongs to the primary vendor, and handing it to a
+      # different one just 401s.
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      COHERE_API_KEY: ${COHERE_API_KEY:-}
+      DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      # The gemini preset reads GEMINI_API_KEY; this repo's canonical spelling
+      # is GOOGLE_API_KEY, so accept either rather than drop the link over a name.
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-${GOOGLE_API_KEY:-}}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     # Loopback only (debug); the API reaches it in-network as http://guardrails:8080
@@ -185,7 +204,7 @@ services:
     networks: ["llmlens"]
     # Loopback only: the dashboard shows every prompt and trace, and the local
     # profile has no auth. SSH-tunnel (ssh -L 5273:localhost:5273) for remote.
-    ports: ["127.0.0.1:5273:80"]   # the llmlens UI (RAG frontend keeps :5173)
+    ports: ["127.0.0.1:5273:80"]   # the llmlens UI (the RAG apps are behind the proxy)
     depends_on:
       llmlens-api: { condition: service_healthy }
     deploy:

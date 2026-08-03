@@ -20,7 +20,7 @@ const NAMES: Record<string, string> = {
 export function QuotaBanner({ detail }: { detail: LimitDetail }) {
   const name = NAMES[detail.limit] ?? detail.limit.replace(/_/g, " ");
   return (
-    <div className="flex items-start gap-2.5 rounded-lg bg-caution/10 px-3.5 py-3 text-[13px] ring-1 ring-inset ring-caution/20">
+    <div className="flex items-start gap-2.5 rounded-lg border border-caution/20 bg-caution/10 px-3.5 py-3 text-sm">
       <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-caution" />
       <div className="min-w-0">
         <p className="font-medium text-strong">

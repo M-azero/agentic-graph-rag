@@ -13,7 +13,10 @@ const ACCEPT = ".pdf,.docx,.txt,.md,.html,.csv,.png,.jpg,.jpeg";
 interface Job {
   id: string;
   name: string;
-  status: "uploading" | "queued" | "running" | "done" | "error";
+  // "partial": stored and searchable, but entity extraction failed for some
+  // chunks so the knowledge graph is incomplete. A degraded success — the
+  // document works, it just answers less well from the graph.
+  status: "uploading" | "queued" | "running" | "done" | "partial" | "error";
   detail?: string;
   chunks?: number;
 }
@@ -68,7 +71,9 @@ export function DocumentsPanel({ onClose }: { onClose: () => void }) {
                 : j,
             ),
           );
-          if (status.status === "done") void refresh();
+          // A partial ingest still stored its chunks, so the file list needs
+          // refreshing exactly as it does for a clean one.
+          if (status.status === "done" || status.status === "partial") void refresh();
         } catch {
           /* a transient poll failure resolves on the next tick */
         }
@@ -114,10 +119,10 @@ export function DocumentsPanel({ onClose }: { onClose: () => void }) {
   return (
     <aside className="flex w-80 shrink-0 flex-col border-l border-border bg-surface">
       <header className="flex h-12 items-center justify-between border-b border-border px-4">
-        <h2 className="text-[13px] font-semibold text-strong">Documents</h2>
+        <h2 className="text-sm font-semibold text-strong">Documents</h2>
         <div className="flex items-center gap-2">
           {limit > 0 && (
-            <span className="font-mono text-[11px] text-muted">
+            <span className="font-mono text-2xs text-muted">
               {used}/{limit}
             </span>
           )}
@@ -156,10 +161,10 @@ export function DocumentsPanel({ onClose }: { onClose: () => void }) {
           )}
         >
           <UploadIcon className="mx-auto mb-2 h-4 w-4 text-muted" />
-          <p className="text-[13px] font-medium text-body">
+          <p className="text-sm font-medium text-body">
             {atLimit ? "Document limit reached" : "Drop files or click to upload"}
           </p>
-          <p className="mt-0.5 text-[11px] text-muted">PDF, Word, text, CSV, images</p>
+          <p className="mt-0.5 text-2xs text-muted">PDF, Word, text, CSV, images</p>
           <input
             ref={inputRef}
             type="file"
@@ -182,18 +187,20 @@ export function DocumentsPanel({ onClose }: { onClose: () => void }) {
               >
                 {job.status === "done" ? (
                   <Badge tone="positive">done</Badge>
+                ) : job.status === "partial" ? (
+                  <Badge tone="caution">partial</Badge>
                 ) : job.status === "error" ? (
                   <Badge tone="danger">failed</Badge>
                 ) : (
                   <Spinner className="h-3 w-3 text-muted" />
                 )}
-                <span className="min-w-0 flex-1 truncate text-[12px] text-body">
+                <span className="min-w-0 flex-1 truncate text-xs text-body">
                   {job.name}
                 </span>
-                {job.status === "done" && job.chunks ? (
-                  <span className="text-[11px] text-muted">{job.chunks} chunks</span>
+                {(job.status === "done" || job.status === "partial") && job.chunks ? (
+                  <span className="text-2xs text-muted">{job.chunks} chunks</span>
                 ) : null}
-                {job.status === "error" && (
+                {(job.status === "error" || job.status === "partial") && (
                   <button
                     onClick={() => setJobs((prev) => prev.filter((j) => j.id !== job.id))}
                     className="text-muted hover:text-body"
@@ -213,6 +220,16 @@ export function DocumentsPanel({ onClose }: { onClose: () => void }) {
           </Alert>
         )}
 
+        {/* Separate from the error alert: the document did import and is
+            searchable, so this explains a degraded result rather than a
+            failure the user has to act on. */}
+        {jobs.some((j) => j.status === "partial") && (
+          <Alert tone="caution">
+            {jobs.find((j) => j.status === "partial")?.detail ??
+              "Imported, but the knowledge graph is incomplete."}
+          </Alert>
+        )}
+
         {loading ? null : files.length === 0 ? (
           <EmptyState
             icon={<FileText className="h-5 w-5" />}
@@ -224,7 +241,7 @@ export function DocumentsPanel({ onClose }: { onClose: () => void }) {
             {files.map((file) => (
               <li key={file.file_id} className="group flex items-center gap-2 rounded-md px-1 py-1.5">
                 <FileText className="h-3.5 w-3.5 shrink-0 text-muted" />
-                <span className="min-w-0 flex-1 truncate text-[12px] text-body" title={file.name}>
+                <span className="min-w-0 flex-1 truncate text-xs text-body" title={file.name}>
                   {file.name}
                 </span>
                 <button

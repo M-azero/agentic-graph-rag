@@ -10,7 +10,7 @@ from langchain_core.messages import HumanMessage
 
 from graphrag.config.settings import OCRCfg, Secrets
 from graphrag.core.messages import content_to_text
-from graphrag.llm.factory import build_chat_model
+from graphrag.llm.factory import build_chat_chain
 from graphrag.ocr.base import OCREngine
 
 
@@ -18,11 +18,13 @@ class VisionLLMOCR(OCREngine):
     def __init__(self, cfg: OCRCfg, secrets: Secrets) -> None:
         v = cfg.vision_llm
         self._prompt = v.prompt
-        # A vision model is just a chat model that accepts image content.
-        self._model = build_chat_model(
+        # A vision model is just a chat model that accepts image content, so
+        # the ordinary chat failover chain covers OCR too.
+        self._model = build_chat_chain(
             provider=v.provider,
             model=v.model,
             secrets=secrets,
+            fallbacks=v.fallbacks,
             temperature=0.0,
             max_tokens=4096,
         )

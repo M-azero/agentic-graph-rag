@@ -3,7 +3,7 @@ import { Link, Navigate, useLocation, useNavigate } from "react-router-dom";
 
 import { ApiError } from "../api";
 import { Alert, Button, Field, Input } from "../components/ui";
-import { useAuth } from "../lib/auth";
+import { safeNext, useAuth } from "../lib/auth";
 import { AuthLayout } from "./AuthLayout";
 
 export default function Login() {
@@ -15,9 +15,27 @@ export default function Login() {
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
 
+  const state = location.state as { from?: string; notice?: string } | null;
+  const next = safeNext(location.search);
+
+  /** Where to go once signed in. `?next=` wins because it is the admin
+   *  console's hand-off, and it is a different app rather than a route here. */
+  function goOnwards() {
+    if (next) {
+      // A different bundle at a different root — a router navigation would try
+      // to resolve it inside this SPA and land on the catch-all.
+      window.location.assign(next);
+      return;
+    }
+    navigate(state?.from ?? "/chat", { replace: true });
+  }
+
   if (!loading && me) {
-    const from = (location.state as { from?: string } | null)?.from;
-    return <Navigate to={from ?? "/chat"} replace />;
+    if (next) {
+      window.location.replace(next);
+      return null;
+    }
+    return <Navigate to={state?.from ?? "/chat"} replace />;
   }
 
   async function submit(event: FormEvent) {
@@ -26,9 +44,7 @@ export default function Login() {
     setBusy(true);
     try {
       await signIn(email, password);
-      navigate((location.state as { from?: string } | null)?.from ?? "/chat", {
-        replace: true,
-      });
+      goOnwards();
     } catch (err) {
       // An unverified account isn't a failed login — it's an unfinished
       // signup, so send them to the step they stopped at.
@@ -56,6 +72,9 @@ export default function Login() {
       }
     >
       <form onSubmit={submit} className="space-y-4">
+        {/* Carried from a completed reset, so the outcome is stated where the
+            user next looks rather than lost in the navigation. */}
+        {state?.notice && <Alert tone="positive">{state.notice}</Alert>}
         {error && <Alert>{error}</Alert>}
         <Field label="Email">
           <Input
@@ -76,6 +95,14 @@ export default function Login() {
             required
           />
         </Field>
+        <div className="flex justify-end">
+          <Link
+            to="/forgot-password"
+            className="text-sm text-muted hover:text-accent hover:underline"
+          >
+            Forgot your password?
+          </Link>
+        </div>
         <Button type="submit" variant="primary" loading={busy} className="w-full">
           Sign in
         </Button>

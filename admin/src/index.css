@@ -1,0 +1,98 @@
+@import "@fontsource-variable/inter";
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* The same palette as the chat app, duplicated rather than shared — two
+   independent builds, one visual identity. Channels (not hex) so Tailwind's
+   <alpha-value> works and every colour can be used at partial opacity.
+
+   Near-neutral greys with a hairline border: the console is mostly tables, and
+   heavy rules between every row are what make an admin panel look like a
+   database viewer instead of a product. */
+@layer base {
+  :root {
+    --canvas: 252 252 251;
+    --surface: 255 255 255;
+    --raised: 246 246 245;
+    --border: 233 233 231;
+    --text-strong: 24 24 27;
+    --text-body: 63 63 70;
+    --text-muted: 130 130 138;
+    --accent: 79 70 229;
+    --accent-soft: 238 238 253;
+    --accent-text: 255 255 255;
+    --positive: 22 143 96;
+    --caution: 191 129 20;
+    --danger: 205 58 58;
+    color-scheme: light;
+  }
+
+  :root.dark {
+    --canvas: 12 12 14;
+    --surface: 18 18 21;
+    --raised: 26 26 30;
+    --border: 38 38 43;
+    --text-strong: 243 243 245;
+    --text-body: 198 198 205;
+    --text-muted: 132 132 141;
+    --accent: 129 122 245;
+    --accent-soft: 39 38 66;
+    --accent-text: 12 12 20;
+    --positive: 60 190 133;
+    --caution: 226 172 63;
+    --danger: 240 112 112;
+    color-scheme: dark;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    @apply bg-canvas text-body antialiased;
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  }
+
+  /* Every number in a console sits in a column next to another number.
+     Proportional digits make those columns ragged and hard to compare. */
+  table,
+  .tnum {
+    font-variant-numeric: tabular-nums;
+  }
+
+  :focus-visible {
+    @apply outline-none ring-2 ring-accent/60 ring-offset-2 ring-offset-canvas;
+  }
+
+  ::selection {
+    @apply bg-accent/20;
+  }
+
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: rgb(var(--border)) transparent;
+  }
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-thumb {
+    @apply rounded-full border-4 border-solid border-transparent bg-clip-padding;
+    background-color: rgb(var(--border));
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+}
+
+@layer components {
+  /* The section label above a stat rail or a table: small, wide-tracked and
+     quiet, so it groups without competing with the data. */
+  .eyebrow {
+    @apply text-2xs font-medium uppercase tracking-wider text-muted;
+  }
+}

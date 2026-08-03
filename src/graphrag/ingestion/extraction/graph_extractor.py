@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import re
+from typing import NamedTuple
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -71,18 +72,33 @@ def _rel_type(raw: str) -> str:
     return cleaned
 
 
+class Extraction(NamedTuple):
+    """What one chunk yielded, and whether the model was reachable at all.
+
+    `failed` is the difference between "this text has no entities" and "the
+    provider refused the call" — identical from the outside (both give empty
+    lists) and opposite in meaning. Without it an ingest whose every extraction
+    call 403'd still reported success, and the user got an empty knowledge
+    graph with nothing to explain it.
+    """
+
+    entities: list[Entity]
+    relations: list[Relation]
+    failed: bool = False
+
+
 class LLMGraphExtractor:
     def __init__(self, llm: BaseChatModel) -> None:
         self._llm = llm
 
-    def extract(self, text: str) -> tuple[list[Entity], list[Relation]]:
+    def extract(self, text: str) -> Extraction:
         messages = [SystemMessage(content=_SYSTEM), HumanMessage(content=text)]
         try:
             raw = content_to_text(self._llm.invoke(messages).content)
             data = self._parse(raw)
         except Exception as exc:
             log.warning("extraction_failed", error=str(exc))
-            return [], []
+            return Extraction([], [], failed=True)
 
         entities = [
             Entity(
@@ -105,7 +121,7 @@ class LLMGraphExtractor:
             if r.get("source", "").strip().lower() in known
             and r.get("target", "").strip().lower() in known
         ]
-        return entities, relations
+        return Extraction(entities, relations)
 
     @staticmethod
     def _parse(raw: str) -> dict:

@@ -118,7 +118,7 @@ export default function Verify() {
           Verify
         </Button>
 
-        <div className="text-center text-[13px] text-muted">
+        <div className="text-center text-sm text-muted">
           {cooldown > 0 ? (
             <span>Didn't get it? You can resend in {cooldown}s.</span>
           ) : (

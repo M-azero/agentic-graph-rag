@@ -4,23 +4,19 @@ import { createBrowserRouter, Navigate, RouterProvider } from "react-router-dom"
 
 import { AppShell } from "./components/AppShell";
 import "./index.css";
-import { AuthProvider, RequireAdmin, RequireAuth } from "./lib/auth";
+import { AuthProvider, RequireAuth } from "./lib/auth";
 import { ThemeProvider } from "./lib/theme";
-import Account from "./routes/Account";
-import Chat from "./routes/Chat";
+import ForgotPassword from "./routes/ForgotPassword";
 import Login from "./routes/Login";
+import ResetPassword from "./routes/ResetPassword";
 import Signup from "./routes/Signup";
 import Verify from "./routes/Verify";
 
-// The admin area is loaded on demand. It pulls in charting, which most users
-// never see — and on the hardware this deploys to, the bytes not sent are the
-// cheapest optimization available.
-const AdminLayout = lazy(() => import("./routes/admin/AdminLayout"));
-const Overview = lazy(() => import("./routes/admin/Overview"));
-const Users = lazy(() => import("./routes/admin/Users"));
-const UserDetail = lazy(() => import("./routes/admin/UserDetail"));
-const Limits = lazy(() => import("./routes/admin/Limits"));
-const System = lazy(() => import("./routes/admin/System"));
+// Chat carries react-markdown and highlight.js — around two thirds of the
+// bundle, and none of it is needed to render a sign-in form. Split so the
+// first page an unauthenticated visitor sees is not the heaviest one.
+const Chat = lazy(() => import("./routes/Chat"));
+const Account = lazy(() => import("./routes/Account"));
 
 function Loading() {
   return (
@@ -33,18 +29,22 @@ function Loading() {
 /** Wraps a page in the signed-in shell. */
 const app = (element: React.ReactNode) => (
   <RequireAuth>
-    <AppShell>{element}</AppShell>
+    <AppShell>
+      <Suspense fallback={<Loading />}>{element}</Suspense>
+    </AppShell>
   </RequireAuth>
 );
 
-const lazyPage = (element: React.ReactNode) => (
-  <Suspense fallback={<Loading />}>{element}</Suspense>
-);
-
+// /admin is deliberately absent. The console is a separate app served from
+// /admin by the proxy, so navigating there is a full page load, not a route —
+// which is what keeps its bundle, its dependencies and its route names out of
+// this one entirely.
 const router = createBrowserRouter([
   { path: "/login", element: <Login /> },
   { path: "/signup", element: <Signup /> },
   { path: "/verify", element: <Verify /> },
+  { path: "/forgot-password", element: <ForgotPassword /> },
+  { path: "/reset-password", element: <ResetPassword /> },
 
   { path: "/", element: <Navigate to="/chat" replace /> },
   { path: "/chat", element: app(<Chat />) },
@@ -53,22 +53,6 @@ const router = createBrowserRouter([
   // back button and a shared link both work.
   { path: "/chat/:threadId", element: app(<Chat />) },
   { path: "/account", element: app(<Account />) },
-
-  {
-    path: "/admin",
-    element: (
-      <RequireAdmin>
-        <AppShell>{lazyPage(<AdminLayout />)}</AppShell>
-      </RequireAdmin>
-    ),
-    children: [
-      { index: true, element: lazyPage(<Overview />) },
-      { path: "users", element: lazyPage(<Users />) },
-      { path: "users/:userId", element: lazyPage(<UserDetail />) },
-      { path: "limits", element: lazyPage(<Limits />) },
-      { path: "system", element: lazyPage(<System />) },
-    ],
-  },
 
   { path: "*", element: <Navigate to="/chat" replace /> },
 ]);

@@ -13,9 +13,17 @@ JudgeErrorKind = Literal["timeout", "api_error", "parse_error", "refusal"]
 
 
 class JudgeError(Exception):
-    """Base class for all judge failures."""
+    """Base class for all judge failures.
+
+    ``provider``/``model`` are stamped on by the failover chain when it gives
+    up, naming the link that produced the final failure. Without them a chain
+    reports every outage against its primary, which is the one link you can be
+    sure was not serving.
+    """
 
     kind: JudgeErrorKind = "api_error"
+    provider: str | None = None
+    model: str | None = None
 
 
 class JudgeTimeout(JudgeError):

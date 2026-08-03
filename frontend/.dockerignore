@@ -1,5 +1,0 @@
-# Never copy the host's node_modules into the image: `npm install` in the
-# builder installs Linux binaries; a Windows/mac host tree copied over it
-# breaks the native deps (esbuild, rollup) — and it's huge.
-node_modules
-dist

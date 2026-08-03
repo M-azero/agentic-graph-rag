@@ -4,6 +4,9 @@ from graphrag.accounts.service import (
     AccountError,
     AccountService,
     Principal,
+    SessionSummary,
+    hash_session_token,
+    lockout_delay,
     normalize_email,
 )
 
@@ -14,6 +17,9 @@ __all__ = [
     "KeyOwner",
     "PgKeyStore",
     "Principal",
+    "SessionSummary",
     "build_email_sender",
+    "hash_session_token",
+    "lockout_delay",
     "normalize_email",
 ]

@@ -16,12 +16,13 @@ from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
-from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 from slowapi.util import get_remote_address
 
 from graphrag import __version__
+from graphrag.api.ratelimit import RATE_LIMITED
 from graphrag.container import Container
 from graphrag.core.logging import get_logger
 from graphrag.jobs import JobStore
@@ -60,10 +61,27 @@ def _rate_key(request: Request) -> str:
     return request.headers.get("X-User-Id") or get_remote_address(request)
 
 
-# Endpoints where a cheap IP-scoped limit is the actual defence: they are
-# reachable without credentials, and each one is a guessing surface (a
-# password, or a six-digit code).
-_AUTH_PATHS = ("/auth/login", "/auth/signup", "/auth/verify", "/auth/resend")
+async def _on_rate_limited(request: Request, exc: RateLimitExceeded) -> Response:
+    """The global limiter's 429, in the same shape as every other 429 here.
+
+    slowapi's stock handler returns a bare string body, which the UI can only
+    render as "429 Too Many Requests". Quota breaches (`limits.deps`) and the
+    per-endpoint auth limits (`api.ratelimit`) both return a structured detail
+    with `code`, `message` and `retry_after`; matching it means the client has
+    one branch for "come back later" rather than three.
+    """
+    retry_after = exc.limit.limit.get_expiry() if exc.limit else 60
+    return JSONResponse(
+        status_code=429,
+        content={
+            "detail": {
+                "code": RATE_LIMITED,
+                "message": "Too many requests. Slow down and try again shortly.",
+                "retry_after": retry_after,
+            }
+        },
+        headers={"Retry-After": str(retry_after)},
+    )
 
 
 async def _csrf_guard(request: Request, call_next):
@@ -83,7 +101,7 @@ async def _csrf_guard(request: Request, call_next):
         if origin:
             allowed = request.app.state.container.settings.api.cors_origins
             # X-Forwarded-Host first so same-origin still resolves behind a proxy
-            # that rewrites Host to an internal name (nginx -> api:8000, a CDN,
+            # that rewrites Host to an internal name (Caddy -> api:8000, a CDN,
             # etc.). A cross-site request can set neither header without tripping
             # a CORS preflight, so trusting them here is safe against the CSRF
             # this guards — and it means the app works at localhost, a bare IP, or
@@ -322,22 +340,38 @@ def create_app(container: Container | None = None) -> FastAPI:
 
     setup_observability(container.settings, container.secrets)
 
+    # With docs off, FastAPI must be told to serve neither the UIs nor the
+    # schema they fetch. Leaving /openapi.json up would publish the whole
+    # contract anyway — the HTML pages are just viewers for it.
+    docs = container.settings.api.docs_enabled
     app = FastAPI(
         title="Agentic Graph RAG",
         version=__version__,
         summary="Hybrid knowledge-graph + vector retrieval, driven by a tool-using agent.",
         lifespan=_lifespan,
+        docs_url="/docs" if docs else None,
+        redoc_url="/redoc" if docs else None,
+        openapi_url="/openapi.json" if docs else None,
     )
+    if not docs:
+        log.info("api_docs_disabled", note="/docs, /redoc and /openapi.json are not served")
     app.state.container = container
     app.state.query_service = QueryService(container)
     app.state.job_store = JobStore(container.redis)
     app.state.users = {container.settings.tenancy.default_user}
     # Real instances are built in the lifespan, once the database engine exists.
     # Limits work without one (falling back to the shipped defaults), so that
-    # one is usable immediately.
+    # one is usable immediately. These are seeded here as well so the app is
+    # usable without the lifespan having run — otherwise any dependency reading
+    # `state.db` raises AttributeError rather than seeing "no database", which
+    # turns a clean 503 into a 500 in tests and scripts.
     app.state.accounts = None
     app.state.key_store = None
     app.state.usage = None
+    app.state.db = None
+    app.state.db_engine = None
+    app.state.arq = None
+    app.state.checkpoint_pool = None
     from graphrag.limits import LimitService
 
     app.state.limits = LimitService(None, container.redis)
@@ -371,7 +405,7 @@ def create_app(container: Container | None = None) -> FastAPI:
         default_limits=[container.settings.api.rate_limit],
         storage_uri=storage_uri,
     )
-    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+    app.add_exception_handler(RateLimitExceeded, _on_rate_limited)
     app.add_middleware(SlowAPIMiddleware)
     app.middleware("http")(_log_requests)
     app.middleware("http")(_csrf_guard)
@@ -387,7 +421,11 @@ def create_app(container: Container | None = None) -> FastAPI:
     )
 
     @app.get("/metrics", include_in_schema=False)
-    def metrics() -> Response:
+    async def metrics(request: Request) -> Response:
+        if not container.settings.api.metrics_public:
+            from graphrag.api.deps import require_admin_user
+
+            await require_admin_user(request)
         return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
     from graphrag.api.routers import (

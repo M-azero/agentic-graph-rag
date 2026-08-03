@@ -4,14 +4,17 @@ as the agent picks retrieval strategies, incremental `token` events, then one
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from collections.abc import AsyncIterator
 
 from graphrag.api.schemas import Source
 from graphrag.core.logging import get_logger
+from graphrag.core.redact import safe_detail
 from graphrag.pipelines import QueryService
-from graphrag.usage.recorder import TOKENS_OUT, record_usage
+from graphrag.usage.meter import TokenMeter
+from graphrag.usage.recorder import record_answer_tokens
 
 log = get_logger(__name__)
 
@@ -58,10 +61,26 @@ async def sse_answer(
     tokens = 0
     answer_parts: list[str] = []
     first_token_at: float | None = None
-    log.info("stream_started", question=question[:80], style=style, user=user_id or "-")
+    # A generator can't return totals, so the meter is passed in and read once
+    # the stream is exhausted. It sees the tool-loop turns too, which is most of
+    # the prompt cost and none of the visible output.
+    meter = TokenMeter()
+    # A fingerprint, not the text. Questions put to a private knowledge base are
+    # the user's content, and logs get shipped, backed up and pasted into
+    # tickets. The hash still correlates repeats and ties a slow run to the
+    # question that caused it, which is what the field was for. The guardrails
+    # service next door already logs verdicts this way.
+    log.info(
+        "stream_started",
+        question_sha=hashlib.sha256(question.encode("utf-8")).hexdigest()[:16],
+        chars=len(question),
+        style=style,
+        user=user_id or "-",
+    )
     try:
         async for kind, data, srcs in service.stream(
-            question, style=style, thread_id=thread_id, user_id=user_id, model=model
+            question, style=style, thread_id=thread_id, user_id=user_id, model=model,
+            meter=meter,
         ):
             sources = srcs
             if kind == "tool":
@@ -104,9 +123,16 @@ async def sse_answer(
                     ),
                 }
 
-        record_usage(redis_client, user_id, tokens)
-        if recorder is not None and account_id:
-            await recorder.record(account_id, TOKENS_OUT, tokens, {"style": style})
+        # Chunks counted here are a real per-token signal, so they beat the
+        # meter's estimate for output; a streamed call usually reports no usage
+        # block at all. Input has no such signal and comes from the meter.
+        metered_in, metered_out = meter.totals
+        await record_answer_tokens(
+            recorder, redis_client,
+            tenant_id=user_id, account_id=account_id,
+            tokens=max(tokens, metered_out), input_tokens=metered_in,
+            meta={"style": style, "stream": True},
+        )
         if on_complete is not None:
             # After `sources`, so a slow write cannot delay the visible answer.
             await on_complete("".join(answer_parts), sources)
@@ -124,8 +150,10 @@ async def sse_answer(
         # event with an empty body and the UI rendered nothing at all. Always
         # send something nameable, and log the traceback server-side — an error
         # nobody can see is indistinguishable from a hang.
-        detail = str(exc) or type(exc).__name__
-        log.exception("stream_failed", error=detail, kind=type(exc).__name__)
-        yield {"event": "error", "data": detail}
+        # Scrubbed before it goes out: this reaches the browser verbatim, and a
+        # provider SDK's message can carry the request URL with the API key in
+        # its query string. The unredacted text stays in the server log.
+        log.exception("stream_failed", error=str(exc), kind=type(exc).__name__)
+        yield {"event": "error", "data": safe_detail(exc)}
     finally:
         yield {"event": "done", "data": "[DONE]"}

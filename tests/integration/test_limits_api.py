@@ -17,7 +17,7 @@ from graphrag.db.engine import session_scope
 from graphrag.db.models import GlobalLimit, UserLimit
 from graphrag.limits import LimitService
 from graphrag.usage import UsageRecorder
-from tests.integration.conftest import requires_db
+from tests.integration.conftest import relax_auth_limits, requires_db
 from tests.unit.test_limits_service import FakeRedis
 
 pytestmark = [pytest.mark.integration, requires_db]
@@ -56,6 +56,7 @@ async def client(db, email_sender):
     container = Container()
     container.settings.auth.enabled = True
     container.settings.storage.vector.provider = "duckdb"
+    relax_auth_limits(container)
 
     app = create_app(container)
     app.state.db = db

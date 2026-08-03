@@ -34,6 +34,12 @@ class Base(DeclarativeBase):
     pass
 
 
+# The two kinds of emailed code. Constants rather than literals because every
+# read of `email_otps` has to filter on one of them (see EmailOTP).
+PURPOSE_VERIFY = "verify"
+PURPOSE_RESET = "reset"
+
+
 def _uuid_pk() -> Mapped[uuid.UUID]:
     return mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
 
@@ -57,6 +63,17 @@ class User(Base):
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
     email_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    password_changed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Lockout state. It lives here rather than in Redis for one reason: the
+    # Redis counters in `limits/service.py` fail *open* by design, which is
+    # right for a quota and exactly wrong for a lockout — an attacker who can
+    # break the counter would be removing the control. Postgres is already read
+    # and written on every login (`_by_email`, `last_login_at`), so this costs
+    # no extra round trip and survives a restart.
+    failed_logins: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = _now()
 
     __table_args__ = (
@@ -73,7 +90,20 @@ class User(Base):
 
 class EmailOTP(Base):
     """Short-lived verification codes. Stored hashed: a leaked database dump
-    must not let someone verify another person's address."""
+    must not let someone verify another person's address.
+
+    Two purposes share this table, and every query MUST scope by `purpose`:
+
+      verify  proves a new address is real, then activates the account
+      reset   proves control of a known address, then sets a new password
+              (also used for an admin invite — "set your password" is the
+              same operation as "reset it")
+
+    They share a lifecycle exactly — hashed code, TTL, attempt cap, one
+    outstanding code per user — but they must never be interchangeable. An
+    unscoped lookup would let a reset code activate a pending account, and
+    issuing one would silently invalidate the other.
+    """
 
     __tablename__ = "email_otps"
 
@@ -82,11 +112,15 @@ class EmailOTP(Base):
         ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
     )
     code_hash: Mapped[str] = mapped_column(Text, nullable=False)
-    purpose: Mapped[str] = mapped_column(String(16), nullable=False, default="verify")
+    purpose: Mapped[str] = mapped_column(
+        String(16), nullable=False, default=PURPOSE_VERIFY, server_default=PURPOSE_VERIFY
+    )
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = _now()
+
+    __table_args__ = (Index("ix_email_otps_user_purpose", "user_id", "purpose"),)
 
 
 class Session(Base):
@@ -137,15 +171,25 @@ _LIMIT_COLUMNS = (
 
 class GlobalLimit(Base):
     """Defaults for every user. Single row (id=1) so the admin panel edits one
-    object rather than a scattered config."""
+    object rather than a scattered config.
+
+    The token ceilings count PROMPT AND COMPLETION together, which is what
+    actually costs money. In RAG the prompt dominates: one measured question on
+    a small corpus spent 7,652 prompt tokens against 594 completion, because
+    every turn of the agent's tool loop resends the system prompt, the
+    conversation and the retrieved chunks. Budget roughly 10k tokens per
+    question, not the few hundred the visible answer suggests.
+    """
 
     __tablename__ = "global_limits"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
     messages_per_minute: Mapped[int] = mapped_column(Integer, nullable=False, default=6)
     messages_per_day: Mapped[int] = mapped_column(Integer, nullable=False, default=100)
-    tokens_per_day: Mapped[int] = mapped_column(BigInteger, nullable=False, default=150_000)
-    tokens_per_month: Mapped[int] = mapped_column(BigInteger, nullable=False, default=2_000_000)
+    # ~10k tokens/question x the 100 messages/day above, with headroom for long
+    # threads (memory grows the prompt every turn) and multi-hop tool loops.
+    tokens_per_day: Mapped[int] = mapped_column(BigInteger, nullable=False, default=1_500_000)
+    tokens_per_month: Mapped[int] = mapped_column(BigInteger, nullable=False, default=20_000_000)
     max_files: Mapped[int] = mapped_column(Integer, nullable=False, default=10)
     max_file_mb: Mapped[int] = mapped_column(Integer, nullable=False, default=15)
     max_storage_mb: Mapped[int] = mapped_column(Integer, nullable=False, default=100)
@@ -318,6 +362,6 @@ IS_ACTIVE = "active"
 
 __all__ = [
     "APIKey", "AppSetting", "AuditLog", "Base", "EmailOTP", "File", "GlobalLimit",
-    "IngestJob", "LIMIT_COLUMNS", "Message", "Session", "Thread", "UsageEvent",
-    "User", "UserLimit",
+    "IngestJob", "LIMIT_COLUMNS", "Message", "PURPOSE_RESET", "PURPOSE_VERIFY",
+    "Session", "Thread", "UsageEvent", "User", "UserLimit",
 ]

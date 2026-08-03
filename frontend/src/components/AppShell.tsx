@@ -1,6 +1,5 @@
 import clsx from "clsx";
 import {
-  LayoutDashboard,
   LogOut,
   MessageSquare,
   Monitor,
@@ -58,7 +57,7 @@ function NavItem({ to, icon, children }: { to: string; icon: ReactNode; children
       to={to}
       className={({ isActive }) =>
         clsx(
-          "inline-flex items-center gap-2 rounded-md px-2.5 py-1.5 text-[13px] font-medium transition-colors",
+          "inline-flex items-center gap-2 rounded-md px-2.5 py-1.5 text-sm font-medium transition-colors",
           isActive ? "bg-raised text-strong" : "text-muted hover:text-body",
         )
       }
@@ -81,25 +80,24 @@ export function AppShell({ children }: { children: ReactNode }) {
 
   return (
     <div className="flex h-full flex-col bg-canvas">
-      <header className="flex h-14 shrink-0 items-center gap-3 border-b border-border bg-surface px-4">
+      <header className="flex h-12 shrink-0 items-center gap-3 border-b border-border bg-surface px-4">
         <Link to="/chat" className="flex items-center gap-2.5">
           <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-accent text-accent-text">
             <Network className="h-3.5 w-3.5" />
           </span>
-          <span className="hidden text-[14px] font-semibold tracking-tight text-strong sm:block">
+          <span className="hidden text-base font-semibold tracking-tight text-strong sm:block">
             Graph RAG
           </span>
         </Link>
 
+        {/* No link to the admin console here. It is a separate app at /admin,
+            and an operator navigates to it directly — putting an entry point in
+            the end-user chrome would advertise the surface to every visitor who
+            reads the markup, for the sake of one URL an admin already knows. */}
         <nav className="ml-2 flex items-center gap-1">
           <NavItem to="/chat" icon={<MessageSquare className="h-3.5 w-3.5" />}>
             Chat
           </NavItem>
-          {me?.role === "admin" && (
-            <NavItem to="/admin" icon={<LayoutDashboard className="h-3.5 w-3.5" />}>
-              Admin
-            </NavItem>
-          )}
         </nav>
 
         <div className="ml-auto flex items-center gap-2">
@@ -107,7 +105,7 @@ export function AppShell({ children }: { children: ReactNode }) {
           <div className="relative">
             <button
               onClick={() => setMenuOpen((v) => !v)}
-              className="flex items-center gap-2 rounded-md px-2 py-1.5 text-[13px] text-muted transition-colors hover:bg-raised hover:text-body"
+              className="flex items-center gap-2 rounded-md px-2 py-1.5 text-sm text-muted transition-colors hover:bg-raised hover:text-body"
               aria-haspopup="menu"
               aria-expanded={menuOpen}
             >
@@ -120,18 +118,18 @@ export function AppShell({ children }: { children: ReactNode }) {
                 {/* Click-away layer: a menu that only closes via its own items
                     strands the user if they change their mind. */}
                 <div className="fixed inset-0 z-40" onClick={() => setMenuOpen(false)} />
-                <div className="absolute right-0 z-50 mt-1 w-48 rounded-lg bg-surface p-1 shadow-pop ring-1 ring-border animate-slide-up">
+                <div className="absolute right-0 z-50 mt-1 w-48 rounded-lg bg-surface p-1 border border-border shadow-pop animate-slide-up">
                   <Link
                     to="/account"
                     onClick={() => setMenuOpen(false)}
-                    className="flex items-center gap-2 rounded-md px-2.5 py-2 text-[13px] text-body hover:bg-raised"
+                    className="flex items-center gap-2 rounded-md px-2.5 py-2 text-sm text-body hover:bg-raised"
                   >
                     <UserCircle className="h-3.5 w-3.5" />
                     Account &amp; usage
                   </Link>
                   <button
                     onClick={handleSignOut}
-                    className="flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left text-[13px] text-body hover:bg-raised"
+                    className="flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left text-sm text-body hover:bg-raised"
                   >
                     <LogOut className="h-3.5 w-3.5" />
                     Sign out

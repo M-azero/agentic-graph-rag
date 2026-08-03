@@ -21,7 +21,7 @@ export function AuthLayout({
           <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-accent text-accent-text">
             <Network className="h-4 w-4" />
           </span>
-          <span className="text-[15px] font-semibold tracking-tight text-strong">
+          <span className="text-base font-semibold tracking-tight text-strong">
             Graph RAG
           </span>
         </div>
@@ -31,7 +31,7 @@ export function AuthLayout({
 
         <div className="mt-6 space-y-4">{children}</div>
 
-        {footer && <div className="mt-6 text-[13px] text-muted">{footer}</div>}
+        {footer && <div className="mt-6 text-sm text-muted">{footer}</div>}
       </div>
     </div>
   );

@@ -7,18 +7,28 @@
 /* Two palettes, one set of names. Channels (not hex) so Tailwind's
    <alpha-value> works and every color can be used at partial opacity.
 
-   The neutrals carry a slight blue cast and the accent is a restrained
-   indigo — enough to mark interactive elements without the saturated
-   purple-to-blue gradients that make an interface look generated. */
+   Near-neutral greys rather than the blue-cast ones this started with: a
+   conversation is mostly text on a background, and a tint in the background
+   reads as a theme rather than as paper. The accent stays a restrained indigo,
+   and the discipline is in *where* it appears — interactive elements only, no
+   saturated gradients.
+
+   --border is the load-bearing value. At a hairline the surfaces separate
+   without the page turning into a grid of boxes; a heavier line here is the
+   single fastest way to make this look like an internal tool.
+
+   These values are duplicated in admin/src/index.css. The two apps are
+   independent builds that must look like one product, so if you change a
+   channel here, change it there. */
 @layer base {
   :root {
-    --canvas: 249 250 251;
+    --canvas: 252 252 251;
     --surface: 255 255 255;
-    --raised: 243 244 246;
-    --border: 226 230 235;
-    --text-strong: 17 24 39;
-    --text-body: 55 65 81;
-    --text-muted: 122 132 148;
+    --raised: 246 246 245;
+    --border: 233 233 231;
+    --text-strong: 24 24 27;
+    --text-body: 63 63 70;
+    --text-muted: 130 130 138;
     --accent: 79 70 229;
     --accent-soft: 238 238 253;
     --accent-text: 255 255 255;
@@ -29,13 +39,13 @@
   }
 
   :root.dark {
-    --canvas: 14 16 20;
-    --surface: 22 25 31;
-    --raised: 31 35 43;
-    --border: 45 50 60;
-    --text-strong: 244 246 249;
-    --text-body: 203 210 220;
-    --text-muted: 138 147 161;
+    --canvas: 12 12 14;
+    --surface: 18 18 21;
+    --raised: 26 26 30;
+    --border: 38 38 43;
+    --text-strong: 243 243 245;
+    --text-body: 198 198 205;
+    --text-muted: 132 132 141;
     --accent: 129 122 245;
     --accent-soft: 39 38 66;
     --accent-text: 12 12 20;
@@ -87,7 +97,7 @@
   /* Markdown answers. Tailwind's typography plugin would be another
      dependency for one surface, so the handful of rules it needs live here. */
   .prose-answer {
-    @apply text-[15px] leading-relaxed text-body;
+    @apply text-base leading-relaxed text-body;
   }
   .prose-answer > * + * {
     @apply mt-3;
@@ -97,9 +107,12 @@
   .prose-answer h3 {
     @apply mt-5 font-semibold text-strong;
   }
+  /* Three steps, and h3 is smaller than body text rather than equal to it —
+     inside an answer it is a run-in label, and at body size it competes with
+     the paragraph it introduces. */
   .prose-answer h1 { @apply text-lg; }
   .prose-answer h2 { @apply text-base; }
-  .prose-answer h3 { @apply text-[15px]; }
+  .prose-answer h3 { @apply text-sm uppercase tracking-wide text-muted; }
   .prose-answer ul { @apply list-disc space-y-1 pl-5; }
   .prose-answer ol { @apply list-decimal space-y-1 pl-5; }
   .prose-answer a { @apply text-accent underline underline-offset-2; }
@@ -108,13 +121,13 @@
     @apply border-l-2 border-border pl-3 text-muted;
   }
   .prose-answer code {
-    @apply rounded bg-raised px-1 py-0.5 font-mono text-[13px] text-strong;
+    @apply rounded bg-raised px-1 py-0.5 font-mono text-sm text-strong;
   }
   .prose-answer pre {
     @apply overflow-x-auto rounded-lg border border-border bg-raised p-3;
   }
   .prose-answer pre code {
-    @apply bg-transparent p-0 text-[13px] leading-relaxed;
+    @apply bg-transparent p-0 text-sm leading-relaxed;
   }
   .prose-answer table {
     @apply block w-full overflow-x-auto border-collapse text-sm;

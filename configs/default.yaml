@@ -13,9 +13,12 @@ app:
 # below (and clears `extra`) — the one-line local <-> API toggle. Embeddings,
 # OCR and rerank are NOT affected by it; they follow the profile.
 llm:
-  # ollama | anthropic | openai | gemini | deepseek | qwen
-  # deepseek and qwen are OpenAI-compatible endpoints (api.deepseek.com,
-  # DashScope compatible-mode); they need DEEPSEEK_API_KEY / DASHSCOPE_API_KEY.
+  # ollama | anthropic | openai | gemini | deepseek | qwen | deepinfra
+  # deepseek, qwen and deepinfra are OpenAI-compatible endpoints
+  # (api.deepseek.com, DashScope compatible-mode, api.deepinfra.com/v1/openai);
+  # they need DEEPSEEK_API_KEY / DASHSCOPE_API_KEY / DEEPINFRA_TOKEN.
+  # DeepInfra serves open-weight models under their upstream ids, which are
+  # case-sensitive and carry the org prefix: "deepseek-ai/DeepSeek-V3".
   provider: ollama
   model: qwen2.5:7b-instruct
   temperature: 0.1
@@ -33,7 +36,7 @@ llm:
 
 # --- Embeddings (rich control — see docs/CONFIGURATION.md) ---------------------
 embeddings:
-  # sentence_transformers | ollama | openai | gemini | voyage | cohere
+  # sentence_transformers | ollama | openai | gemini | voyage | cohere | deepinfra
   # `sentence_transformers` runs the model in-process for full control over every
   # knob below; it needs the `local-models` extra (it pulls torch, ~3.9 GB). Both
   # shipped profiles override this — `local` uses ollama, `api` uses voyage.
@@ -164,6 +167,29 @@ auth:
                               #       the verified key sets the user; X-User-Id ignored
                               # set GRAPHRAG_ADMIN_KEY in .env to gate user creation
 
+  # Lockout after consecutive failed logins. 0 disables it. The threshold is
+  # deliberately loose — someone working through a password manager should not
+  # lock themselves out — because rate_limits below is what caps attack volume;
+  # the lock is what stops a slow guess that stays under every rate limit.
+  # State lives in Postgres, not Redis: the Redis counters elsewhere fail OPEN
+  # by design, which is right for a quota and wrong for a lockout.
+  # Clear one with `make unlock EMAIL=...` or the admin console.
+  lockout_threshold: 10
+  lockout_base_seconds: 60    # first lock past the threshold, then doubling
+  lockout_max_seconds: 3600
+
+  # Per-IP limits on the endpoints reachable without credentials, applied ON TOP
+  # OF api.rate_limit (not instead of it). Each is a guessing surface — a
+  # password or a six-digit code — and the global bucket is far too generous.
+  # Empty string disables one. Behind the bundled Caddy these key on X-Real-IP,
+  # which the proxy sets and a caller cannot forge.
+  rate_limits:
+    login: 10/minute
+    signup: 5/minute
+    verify: 10/minute
+    resend: 3/minute          # tightest: sends email, and the free tier is ~100/day
+    reset: 5/minute           # forgot-password + reset-password
+
 # --- Multi-user ---------------------------------------------------------------
 tenancy:
   enabled: true
@@ -197,12 +223,16 @@ observability:
 
 # --- API ----------------------------------------------------------------------
 api:
-  cors_origins: ["http://localhost:5173"]
+  # The two Vite dev servers: 5173 is the chat app, 5174 the admin console.
+  # In production both are served from the same origin as the API, so this
+  # list is only consulted in development — and by the CSRF guard, which
+  # falls back to a same-host comparison.
+  cors_origins: ["http://localhost:5173", "http://localhost:5174"]
   cors_methods: ["GET", "POST", "OPTIONS"]
   cors_headers: ["Content-Type", "X-User-Id", "Authorization"]
   stream: true
   rate_limit: "60/minute"     # per user; falls back to client IP
   max_upload_mb: 25           # reject larger uploads. Raising this alone isn't
                               # enough: MAX_UPLOAD_MB in .env must be >= it, or
-                              # the frontend's nginx 413s the upload first.
+                              # Caddy 413s the upload first.
   max_files_per_user: 10      # cap on uploaded files per user

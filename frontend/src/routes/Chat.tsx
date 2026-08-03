@@ -232,7 +232,7 @@ export default function Chat() {
       />
 
       <section className="flex min-w-0 flex-1 flex-col">
-        <div className="flex h-12 shrink-0 items-center justify-end border-b border-border px-4">
+        <div className="flex h-11 shrink-0 items-center justify-end px-4">
           {!showDocs && (
             <Button size="sm" variant="ghost" onClick={() => setShowDocs(true)}>
               <PanelRightOpen className="h-3.5 w-3.5" />
@@ -241,8 +241,10 @@ export default function Chat() {
           )}
         </div>
 
-        <div className="min-h-0 flex-1 overflow-y-auto px-4 py-6">
-          <div className="mx-auto max-w-3xl space-y-6">
+        {/* One column, and the composer shares its width. A full-bleed input
+            under a narrow transcript makes the page feel like two designs. */}
+        <div className="min-h-0 flex-1 overflow-y-auto px-6">
+          <div className="mx-auto max-w-[46rem] space-y-8 py-8">
             {quota && <QuotaBanner detail={quota} />}
             {error && <Alert>{error}</Alert>}
 
@@ -266,18 +268,20 @@ export default function Chat() {
           </div>
         </div>
 
-        <Composer
-          value={input}
-          onChange={setInput}
-          onSend={send}
-          onStop={stop}
-          busy={busy}
-          style={style}
-          onStyleChange={setStyle}
-          model={model}
-          onModelChange={setModel}
-          models={me?.models ?? []}
-        />
+        <div className="mx-auto w-full max-w-[46rem] px-6 pb-5">
+          <Composer
+            value={input}
+            onChange={setInput}
+            onSend={send}
+            onStop={stop}
+            busy={busy}
+            style={style}
+            onStyleChange={setStyle}
+            model={model}
+            onModelChange={setModel}
+            models={me?.models ?? []}
+          />
+        </div>
       </section>
 
       {showDocs && <DocumentsPanel onClose={() => setShowDocs(false)} />}

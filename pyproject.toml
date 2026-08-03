@@ -123,7 +123,11 @@ warn_unused_ignores = true
 disallow_untyped_defs = false
 
 [tool.pytest.ini_options]
-pythonpath = ["src"]
+# integrations/guardrails is a vendored sibling project, not a dependency. It is
+# on the path so this repo's gate covers the judge failover chain the guard
+# depends on — screening fails *open*, so a regression there is invisible at
+# runtime and has to be caught here.
+pythonpath = ["src", "integrations/guardrails"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 markers = ["integration: tests needing Neo4j/Redis (skipped by default)"]

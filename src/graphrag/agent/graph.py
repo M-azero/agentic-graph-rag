@@ -5,6 +5,7 @@ optional Redis-backed multi-turn memory, and exposes a blocking `run`, an async
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from typing import Any
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
@@ -142,15 +143,23 @@ def build_checkpointer(
 class AgentSession:
     """One question in flight. Holds the per-query source collector."""
 
-    def __init__(self, agent, question: str, config: dict, ctx: ToolContext) -> None:
+    def __init__(
+        self, agent, question: str, config: dict, ctx: ToolContext, meter: Any = None
+    ) -> None:
         self._agent = agent
         self._input = {"messages": [HumanMessage(content=question)]}
         self._config = config
         self._ctx = ctx
+        self._meter = meter
 
     @property
     def sources(self) -> list[RetrievedChunk]:
         return self._ctx.collected
+
+    @property
+    def usage(self) -> tuple[int, int]:
+        """(input, output) tokens for this run — (0, 0) when unmetered."""
+        return self._meter.totals if self._meter is not None else (0, 0)
 
     def _shape(self, result) -> QueryResult:
         messages = result["messages"]
@@ -164,7 +173,11 @@ class AgentSession:
             for m in messages if isinstance(m, AIMessage)
             for tc in (m.tool_calls or [])
         ]
-        return QueryResult(answer=answer, sources=self.sources, tool_calls=tool_calls)
+        tokens_in, tokens_out = self.usage
+        return QueryResult(
+            answer=answer, sources=self.sources, tool_calls=tool_calls,
+            input_tokens=tokens_in, output_tokens=tokens_out,
+        )
 
     def run(self) -> QueryResult:
         """Blocking run — CLI and scripts. Needs a sync-capable checkpointer."""
@@ -254,6 +267,7 @@ class AgentRunner:
         style: str | None = None,
         thread_id: str = "default",
         model: BaseChatModel | None = None,
+        meter: Any | None = None,
     ) -> AgentSession:
         ctx = ToolContext(
             vector=self._vector,
@@ -264,8 +278,13 @@ class AgentRunner:
             graph_hops=self._graph_hops,
         )
         agent = self._make_agent(ctx, style, model)
-        config = {
+        config: dict[str, Any] = {
             "configurable": {"thread_id": thread_id},
             "recursion_limit": self._recursion_limit,
         }
-        return AgentSession(agent, question, config, ctx)
+        if meter is not None:
+            # Scoped to this invocation, which is the point: the checkpointer
+            # keeps the whole thread in state, so anything that counted tokens
+            # from the final message list would re-charge every earlier turn.
+            config["callbacks"] = [meter]
+        return AgentSession(agent, question, config, ctx, meter)

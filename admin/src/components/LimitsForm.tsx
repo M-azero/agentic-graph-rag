@@ -1,6 +1,6 @@
 import { useState } from "react";
 
-import { Button, Input } from "../ui";
+import { Button, Input } from "./ui";
 
 export const LIMIT_FIELDS = [
   { key: "messages_per_minute", label: "Messages / minute" },
@@ -60,7 +60,7 @@ export function LimitsForm({
       <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
         {LIMIT_FIELDS.map(({ key, label }) => (
           <div key={key}>
-            <label className="mb-1 block text-[12px] text-muted" htmlFor={key}>
+            <label className="mb-1 block text-xs text-muted" htmlFor={key}>
               {label}
             </label>
             <Input
@@ -74,7 +74,7 @@ export function LimitsForm({
                   ? `${inherited[key] ?? 0} (inherited)`
                   : undefined
               }
-              className="font-mono text-[13px]"
+              className="font-mono text-sm"
             />
           </div>
         ))}
@@ -90,7 +90,7 @@ export function LimitsForm({
           </Button>
         )}
         {mode === "override" && (
-          <p className="text-[12px] text-muted">Empty means inherit the default.</p>
+          <p className="text-xs text-muted">Empty means inherit the default.</p>
         )}
       </div>
     </div>
