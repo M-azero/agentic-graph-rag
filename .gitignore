@@ -47,3 +47,6 @@ admin/dist/
 .DS_Store
 .idea/
 .vscode/
+scripts/harden-host.sh
+docs/HARDENING.md
+docs/MULTI-AGENT-PLAN.md
