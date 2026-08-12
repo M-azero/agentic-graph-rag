@@ -31,6 +31,7 @@ from graphrag.db.engine import session_scope
 from graphrag.db.models import Message, Thread
 from graphrag.limits import LimitService, get_limits, reject_with
 from graphrag.limits.service import LimitBreach
+from graphrag.shelves import shelf_for_request
 
 router = APIRouter(prefix="/threads", tags=["threads"])
 
@@ -59,6 +60,7 @@ def _shape(thread: Thread) -> ThreadInfo:
         title=thread.title,
         created_at=thread.created_at.isoformat() if thread.created_at else "",
         updated_at=thread.updated_at.isoformat() if thread.updated_at else "",
+        shelf_id=str(thread.shelf_id) if thread.shelf_id else None,
     )
 
 
@@ -107,6 +109,10 @@ async def create_thread(
 ) -> ThreadInfo:
     owner = _user_uuid(user)
     effective = await limits.effective(user.user_id)
+    # Resolved (and ownership-checked) before the transaction: `resolve` opens
+    # its own session, and nesting one inside this one would deadlock on the
+    # same connection.
+    shelf = await shelf_for_request(db, user, payload.shelf_id)
     async with session_scope(_require_db(db)) as s:
         live = (
             await s.execute(
@@ -120,7 +126,15 @@ async def create_thread(
                 LimitBreach("max_threads", int(live), effective.max_threads)
             )
 
-        thread = Thread(user_id=owner, title=(payload.title or "New chat")[:120])
+        thread = Thread(
+            user_id=owner,
+            title=(payload.title or "New chat")[:120],
+            # Pinned here and never changed. The agent's memory for this thread
+            # is keyed on the shelf's corpus, so a conversation that moved
+            # shelves would lose its history and start citing passages its own
+            # transcript never mentioned.
+            shelf_id=shelf.id,
+        )
         s.add(thread)
         await s.flush()
         return _shape(thread)

@@ -32,21 +32,42 @@ class StubQueryService:
     These tests are about the gate in front of the agent, not the agent. A real
     QueryService would reach for an embedder and an LLM that aren't running
     here, turning a limit assertion into a connectivity test.
+
+    The `**_kwargs` on both methods is deliberate. Every optional argument the
+    router learns to pass — `meter`, `shelf`, `preset` — arrives here first, and
+    a stub that enumerated them would turn each addition into an unrelated red
+    suite. What these tests assert is *whether* the agent was reached, which is
+    `calls`; the arguments are covered where they mean something.
     """
+
+    # The router picks `areview` over `aanswer` when review is on. Off here:
+    # these tests count how many times the agent is reached, and the review loop
+    # would reach it more than once for reasons that have nothing to do with
+    # quotas.
+    review_enabled = False
 
     def __init__(self) -> None:
         self.calls: list[str] = []
 
-    async def aanswer(self, question, style=None, thread_id="default", user_id=None, model=None):
+    async def aanswer(
+        self, question, style=None, thread_id="default", user_id=None, model=None,
+        **_kwargs,
+    ):
         from graphrag.core.types import QueryResult
 
         self.calls.append(question)
         return QueryResult(answer=f"answer to: {question}", sources=[], tool_calls=[])
 
-    async def stream(self, question, style=None, thread_id="default", user_id=None, model=None):
+    async def stream(
+        self, question, style=None, thread_id="default", user_id=None, model=None,
+        **_kwargs,
+    ):
         self.calls.append(question)
         for token in ("answer ", "to ", question):
-            yield "token", token, []
+            # Four elements: (kind, data, sources, source_labels). The labels
+            # carry graph-derived provenance, which citation checking needs to
+            # tell a graph-backed citation from an invented one.
+            yield "token", token, [], []
 
 
 @pytest_asyncio.fixture

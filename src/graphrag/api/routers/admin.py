@@ -48,6 +48,7 @@ from graphrag.db.models import (
     AuditLog,
     File,
     GlobalLimit,
+    Shelf,
     Thread,
     UsageEvent,
     User,
@@ -61,10 +62,33 @@ log = get_logger(__name__)
 _MODELS_KEY = "enabled_models"
 
 
+_NEEDS_DB = "The admin panel needs a database."
+
+
 def _require_db(db):
     if db is None:
-        raise HTTPException(status_code=503, detail="The admin panel needs a database.")
+        raise HTTPException(status_code=503, detail=_NEEDS_DB)
     return db
+
+
+def _require_accounts(request: Request):
+    """The account service, or 503.
+
+    `available` as well as `is not None`: the service object exists even when
+    the deployment has no database, and calling into it then raises out of
+    `session_scope` — a 500 where the honest answer is "this needs Postgres".
+    """
+    accounts = request.app.state.accounts
+    if accounts is None or not accounts.available:
+        raise HTTPException(status_code=503, detail=_NEEDS_DB)
+    return accounts
+
+
+def _require_key_store(request: Request):
+    key_store = request.app.state.key_store
+    if key_store is None or not key_store.available:
+        raise HTTPException(status_code=503, detail=_NEEDS_DB)
+    return key_store
 
 
 def _uid(value: str) -> uuid.UUID:
@@ -233,6 +257,16 @@ async def user_detail(
                 select(File).where(File.user_id == owner).order_by(File.created_at.desc())
             )
         ).scalars().all()
+        # Every shelf, plus the default (slug "") whose row may not exist on an
+        # account created before shelves. Without this the panel would report
+        # only the default shelf's graph and quietly understate anyone who keeps
+        # their documents on a named one.
+        shelf_slugs = set(
+            (
+                await s.execute(select(Shelf.slug).where(Shelf.user_id == owner))
+            ).scalars().all()
+        )
+        shelf_slugs.add("")
         tenant_id = user.tenant_id
         shaped = _shape_user(
             user,
@@ -252,13 +286,19 @@ async def user_detail(
         },
         usage={k: int(v or 0) for k, v in usage_rows},
         storage_used_mb=round(int(stored) / (1024 * 1024), 2),
-        graph=_graph_stats(container, tenant_id),
-        files=[StoredFile(file_id=f.id, name=f.name, source=f.path) for f in file_rows],
+        graph=_graph_stats(container, tenant_id, shelf_slugs),
+        files=[
+            StoredFile(
+                file_id=f.id, name=f.name, source=f.path,
+                shelf_id=str(f.shelf_id) if f.shelf_id else None,
+            )
+            for f in file_rows
+        ],
     )
 
 
-def _graph_store(container: Container, tenant_id: str):
-    """A graph store for one tenant, without building the rest of the tenant.
+def _graph_store(container: Container, tenant_id: str, shelf: str = ""):
+    """A graph store for one shelf, without building the rest of the tenant.
 
     `container.tenant()` would also construct the embedder, reranker and agent —
     so inspecting a user's graph would load models, and stall on a provider
@@ -266,17 +306,30 @@ def _graph_store(container: Container, tenant_id: str):
     """
     from graphrag.storage import build_graph_store
 
-    database, corpus = container._resolve_scope(tenant_id)
+    database, corpus = container._resolve_scope(tenant_id, shelf)
     return build_graph_store(container.driver, database, corpus, container.settings)
 
 
-def _graph_stats(container: Container, tenant_id: str) -> dict[str, int]:
-    """Neo4j may be down; an admin page should still render the rest."""
-    try:
-        return _graph_store(container, tenant_id).stats()
-    except Exception as exc:
-        log.warning("graph_stats_unavailable", tenant=tenant_id, error=str(exc))
-        return {}
+def _graph_stats(
+    container: Container, tenant_id: str, shelves: set[str] | None = None
+) -> dict[str, int]:
+    """The user's graph totals, summed over their shelves.
+
+    Summed rather than reported per shelf because this feeds an account
+    overview: an admin looking at "does this user have a knowledge graph" wants
+    one set of numbers. Neo4j may be down, and an admin page should still render
+    the rest — so a failure on any shelf contributes nothing rather than raising.
+    """
+    totals: dict[str, int] = {}
+    for slug in sorted(shelves if shelves is not None else {""}):
+        try:
+            for key, value in _graph_store(container, tenant_id, slug).stats().items():
+                totals[key] = totals.get(key, 0) + int(value or 0)
+        except Exception as exc:
+            log.warning(
+                "graph_stats_unavailable", tenant=tenant_id, shelf=slug, error=str(exc)
+            )
+    return totals
 
 
 @router.post("/users", response_model=AdminUser, status_code=201)
@@ -293,9 +346,7 @@ async def create_user(
     too. No password crosses this boundary: the invitee sets their own via the
     emailed code, through the same reset flow everyone else uses.
     """
-    accounts = request.app.state.accounts
-    if accounts is None:
-        raise HTTPException(status_code=503, detail="The admin panel needs a database.")
+    accounts = _require_accounts(request)
     try:
         user = await accounts.admin_create_user(payload.email, payload.role)
     except AccountError as exc:
@@ -322,9 +373,7 @@ async def force_password_reset(
     the code goes out, so there is no window in which a stolen session is still
     usable.
     """
-    accounts = request.app.state.accounts
-    if accounts is None:
-        raise HTTPException(status_code=503, detail="The admin panel needs a database.")
+    accounts = _require_accounts(request)
     if not await accounts.admin_force_reset(user_id):
         raise HTTPException(status_code=404, detail="No such user.")
     async with session_scope(_require_db(db)) as s:
@@ -345,9 +394,7 @@ async def unlock_user(
     user is waiting out the backoff, which reaches an hour. `graphrag unlock`
     is the equivalent for when the locked-out account is the only admin.
     """
-    accounts = request.app.state.accounts
-    if accounts is None:
-        raise HTTPException(status_code=503, detail="The admin panel needs a database.")
+    accounts = _require_accounts(request)
     if not await accounts.unlock(user_id):
         raise HTTPException(status_code=404, detail="No such user.")
     async with session_scope(_require_db(db)) as s:
@@ -385,11 +432,16 @@ async def patch_user(
 
     if payload.status == "suspended":
         # Don't wait for caches to expire — a suspension should bite now.
+        #
+        # Deliberately soft rather than `_require_accounts`: the status change
+        # is already committed at this point, so raising here would report a
+        # suspension that did in fact happen as a failure. `available` guards
+        # the same call raising out of `session_scope` for want of a database.
         accounts = request.app.state.accounts
-        if accounts is not None:
+        if accounts is not None and accounts.available:
             await accounts.revoke_sessions(user_id)
         key_store = request.app.state.key_store
-        if key_store is not None:
+        if key_store is not None and key_store.available:
             await key_store.revoke_user(user_id)
     return shaped
 
@@ -401,8 +453,11 @@ async def revoke_keys(
     admin: AuthUser | None = Depends(require_admin_user),
     db=Depends(get_db),
 ) -> Acknowledged:
-    revoked = await request.app.state.key_store.revoke_user(user_id)
-    async with session_scope(_require_db(db)) as s:
+    # Both checks before the write: revoking keys and then failing to audit it
+    # is the one ordering that loses the record of what happened.
+    _require_db(db)
+    revoked = await _require_key_store(request).revoke_user(user_id)
+    async with session_scope(db) as s:
         await _audit(s, admin, "user.revoke_keys", _uid(user_id), revoked=revoked)
     return Acknowledged(message=f"Revoked {revoked} key(s).")
 
@@ -420,7 +475,7 @@ async def resend_verification(
         if user is None:
             raise HTTPException(status_code=404, detail="No such user.")
         email = user.email
-    await request.app.state.accounts.resend_code(email)
+    await _require_accounts(request).resend_code(email)
     return Acknowledged(message="Verification code sent.")
 
 
@@ -611,39 +666,59 @@ async def usage_series(
 
 # -- graph inspection ---------------------------------------------------------
 
+async def _tenant_and_shelves(s, user_id: str) -> tuple[str, set[str]]:
+    """A user's storage namespace and every shelf slug in it, or 404."""
+    user = (
+        await s.execute(select(User).where(User.id == _uid(user_id)))
+    ).scalar_one_or_none()
+    if user is None:
+        raise HTTPException(status_code=404, detail="No such user.")
+    slugs = set(
+        (
+            await s.execute(select(Shelf.slug).where(Shelf.user_id == user.id))
+        ).scalars().all()
+    )
+    slugs.add("")  # the default shelf may have no row on an older account
+    return user.tenant_id, slugs
+
+
 @router.get("/users/{user_id}/graph", response_model=dict)
 async def user_graph_stats(
     user_id: str, db=Depends(get_db), container: Container = Depends(get_container)
 ) -> dict:
+    """Graph totals across every shelf the user has."""
     async with session_scope(_require_db(db)) as s:
-        user = (
-            await s.execute(select(User).where(User.id == _uid(user_id)))
-        ).scalar_one_or_none()
-        if user is None:
-            raise HTTPException(status_code=404, detail="No such user.")
-        tenant_id = user.tenant_id
-    return _graph_stats(container, tenant_id)
+        tenant_id, slugs = await _tenant_and_shelves(s, user_id)
+    return _graph_stats(container, tenant_id, slugs)
 
 
 @router.get("/users/{user_id}/graph/sample", response_model=GraphSample)
 async def user_graph_sample(
     user_id: str,
     limit: int = Query(100, ge=1, le=500),
+    shelf: str = Query("", max_length=32),
     db=Depends(get_db),
     container: Container = Depends(get_container),
 ) -> GraphSample:
-    """Highest-degree slice of a user's entity graph, for visualization."""
+    """Highest-degree slice of one shelf's entity graph, for visualization.
+
+    One shelf, not the union: each is a separate graph with no edges between
+    them, so drawing them together would render as disconnected islands that
+    imply a relationship the data does not have. `shelf` is a slug; empty is the
+    default shelf.
+    """
     async with session_scope(_require_db(db)) as s:
-        user = (
-            await s.execute(select(User).where(User.id == _uid(user_id)))
-        ).scalar_one_or_none()
-        if user is None:
-            raise HTTPException(status_code=404, detail="No such user.")
-        tenant_id = user.tenant_id
+        tenant_id, slugs = await _tenant_and_shelves(s, user_id)
+    if shelf not in slugs:
+        raise HTTPException(status_code=404, detail="No such shelf for this user.")
     try:
-        return GraphSample(**_graph_store(container, tenant_id).sample_subgraph(limit))
+        return GraphSample(
+            **_graph_store(container, tenant_id, shelf).sample_subgraph(limit)
+        )
     except Exception as exc:
-        log.warning("graph_sample_unavailable", tenant=tenant_id, error=str(exc))
+        log.warning(
+            "graph_sample_unavailable", tenant=tenant_id, shelf=shelf, error=str(exc)
+        )
         return GraphSample()
 
 
@@ -721,12 +796,19 @@ async def get_models(
 @router.put("/models", response_model=ModelSettings)
 async def set_models(
     payload: ModelSettingsUpdate,
+    request: Request,
     admin: AuthUser | None = Depends(require_admin_user),
     db=Depends(get_db),
     container: Container = Depends(get_container),
 ) -> ModelSettings:
     """Narrow what the chat UI offers. Disabling everything is refused — it
-    would leave users with no model to talk to."""
+    would leave users with no model to talk to.
+
+    The write-back to `app.state` is what makes this setting mean anything. It
+    was persisted and then read by nobody: /query resolved model overrides
+    against `llm.allowed` alone, so a disabled model vanished from the picker
+    and stayed fully callable over the API.
+    """
     known = {m.model for m in allowed_models(container.settings)}
     enabled = [m for m in payload.enabled if m in known]
     if not enabled:
@@ -742,6 +824,7 @@ async def set_models(
             row.value = {"enabled": enabled}
         await _audit(s, admin, "models.set", None, enabled=enabled)
 
+    request.app.state.enabled_models = enabled
     return await get_models(db, container)
 
 

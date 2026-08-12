@@ -119,7 +119,7 @@ def apikey(email: str, label: str = typer.Option("", help="a note to identify th
             if user is None:
                 return None
             user_id, tenant = str(user.id), user.tenant_id
-        key = await keys.create_key(user_id, label)
+        _key_id, key = await keys.create_key(user_id, label)
         container.tenant(tenant)  # ensure the namespace exists
         await engine.dispose()
         return key

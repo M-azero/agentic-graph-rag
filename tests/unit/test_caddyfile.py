@@ -146,3 +146,48 @@ def test_nothing_still_points_at_the_removed_frontend_container(caddyfile):
     """The static files are baked into this image now. A leftover
     `reverse_proxy frontend:80` would fail DNS on every page load."""
     assert "frontend:80" not in caddyfile
+
+
+def test_the_proxy_body_cap_clears_the_api_file_cap(caddyfile):
+    """The two upload limits measure DIFFERENT things, so equal values are a bug.
+
+    Caddy's `request_body max_size` bounds the whole multipart body; the API's
+    `api.max_upload_mb` bounds the file inside it (`len(data)` in the ingest
+    router). Set both to 25 and a file of exactly 25 MB — the size the API's own
+    error message says is allowed — is refused by the proxy instead, as a bare
+    413 with no explanation, because the boundaries and part headers push the
+    body past the cap. Every shipped default must leave the proxy strictly
+    higher.
+    """
+    import yaml
+
+    root = CADDYFILE.resolve().parents[1]
+
+    api_mb = yaml.safe_load(
+        (root / "configs" / "default.yaml").read_text(encoding="utf-8")
+    )["api"]["max_upload_mb"]
+
+    caddy_default = int(re.search(r"max_size \{\$MAX_UPLOAD_MB:(\d+)\}MB", caddyfile).group(1))
+    assert caddy_default > api_mb, (
+        f"Caddyfile default {caddy_default}MB must exceed api.max_upload_mb {api_mb}MB"
+    )
+
+    compose = yaml.safe_load((root / "docker-compose.yml").read_text(encoding="utf-8"))
+    proxy_env = compose["services"]["proxy"]["environment"]["MAX_UPLOAD_MB"]
+    compose_default = int(re.search(r":-(\d+)\}", proxy_env).group(1))
+    assert compose_default > api_mb, "compose default must exceed api.max_upload_mb"
+
+    image_default = int(
+        re.search(
+            r"ENV MAX_UPLOAD_MB=(\d+)",
+            (root / "docker" / "Dockerfile.proxy").read_text(encoding="utf-8"),
+        ).group(1)
+    )
+    assert image_default > api_mb, "Dockerfile.proxy default must exceed api.max_upload_mb"
+
+    example = re.search(
+        r"^MAX_UPLOAD_MB=(\d+)",
+        (root / ".env.example").read_text(encoding="utf-8"),
+        re.M,
+    )
+    assert int(example.group(1)) > api_mb, ".env.example must exceed api.max_upload_mb"

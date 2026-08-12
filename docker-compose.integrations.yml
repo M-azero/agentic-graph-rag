@@ -55,6 +55,14 @@ services:
       GUARD_LLM_TOTAL_TIMEOUT_S: ${GUARD_LLM_TOTAL_TIMEOUT_S:-}
       GUARD_LLM_FAILOVER_MAX_FAILURES: ${GUARD_LLM_FAILOVER_MAX_FAILURES:-2}
       GUARD_LLM_FAILOVER_COOLDOWN_S: ${GUARD_LLM_FAILOVER_COOLDOWN_S:-300}
+      # This service has no env_file (see below), so every security-relevant
+      # knob must be forwarded HERE or a value set in .env is silently ignored.
+      # For fail_mode that failure is the bad kind: an operator who chose
+      # `closed` keeps running fail-open, and nothing anywhere says so.
+      GUARD_FAIL_MODE: ${GUARD_FAIL_MODE:-flag}
+      GUARD_ALLOW_CLIENT_MODE: ${GUARD_ALLOW_CLIENT_MODE:-false}
+      GUARD_ENABLE_DOCS: ${GUARD_ENABLE_DOCS:-false}
+      GUARD_LOG_INPUTS: ${GUARD_LOG_INPUTS:-false}
       # This service has NO env_file (deliberately — it should not see the RAG
       # stack's whole secret set), so every fallback link's native key has to
       # be listed here or the link is dropped at startup. GUARD_LLM_API_KEY is
@@ -74,7 +82,7 @@ services:
     ports: ["127.0.0.1:8080:8080"]
     deploy:
       resources:
-        limits: { cpus: "${GUARDRAILS_CPU_LIMIT:-0.5}", memory: "${GUARDRAILS_MEM_LIMIT:-256m}" }
+        limits: { cpus: "${GUARDRAILS_CPU_LIMIT:-1}", memory: "${GUARDRAILS_MEM_LIMIT:-512m}" }
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
       interval: 10s
@@ -89,8 +97,13 @@ services:
     environment:
       CLICKHOUSE_DB: llmlens
       CLICKHOUSE_USER: default
-      CLICKHOUSE_PASSWORD: ""
-      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+      # A real password even though nothing publishes this port: every
+      # container on the llmlens network could otherwise read — and administer
+      # — the span store. The entrypoint re-applies this on each container
+      # start (users.d is not on the data volume), so changing it in .env takes
+      # effect on the next `up`, unlike Postgres. Access management stays off:
+      # the server only ever creates tables, never users.
+      CLICKHOUSE_PASSWORD: ${LLMLENS_CLICKHOUSE_PASSWORD:-llmlens-local-only}
     volumes: ["llmlens_clickhouse_data:/var/lib/clickhouse"]
     networks:
       llmlens: { aliases: ["clickhouse"] }
@@ -110,6 +123,18 @@ services:
   # feature is the kind of sprawl a small box can't afford). This one-shot
   # creates that database if it's missing — needed because the server's volume
   # may predate the overlay, so an image init script would never run.
+  #
+  # It also creates a dedicated `llmlens` role that owns that database and
+  # nothing else, and the DSN below signs in as it — NOT as the graphrag
+  # superuser. The observability stack has no business holding credentials to
+  # the accounts database (password hashes, sessions, chat history); a
+  # compromised dashboard should get at telemetry, not at logins. The ALTER
+  # runs every deploy so a password change in .env actually takes effect —
+  # unlike POSTGRES_PASSWORD, which bakes in when the volume is created.
+  #
+  # Upgrading a deployment whose llmlens database predates the role: its tables
+  # are owned by the old superuser and the new role cannot touch them. Spans
+  # are derived data, so the clean fix is `dropdb llmlens` before `up`.
   llmlens-db-init:
     image: postgres:16-alpine
     profiles: ["observability"]
@@ -118,11 +143,19 @@ services:
       PGHOST: postgres
       PGUSER: ${POSTGRES_USER:-graphrag}
       PGPASSWORD: ${GRAPHRAG_POSTGRES_PASSWORD:-change-me}
+      LLMLENS_DB_PASSWORD: ${LLMLENS_POSTGRES_PASSWORD:-llmlens-local-only}
     entrypoint: ["sh", "-ec"]
+    # `:'pw'` is psql's own quoting, so the password cannot break out of the
+    # statement whatever characters it holds.
     command:
-      - >
-        psql -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='llmlens'"
-        | grep -q 1 || createdb llmlens
+      - |
+        psql -d postgres -tAc "SELECT 1 FROM pg_roles WHERE rolname='llmlens'" | grep -q 1 \
+          || psql -v ON_ERROR_STOP=1 -d postgres -c "CREATE ROLE llmlens LOGIN"
+        psql -v ON_ERROR_STOP=1 -v pw="$$LLMLENS_DB_PASSWORD" -d postgres \
+          -c "ALTER ROLE llmlens WITH LOGIN PASSWORD :'pw'"
+        psql -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='llmlens'" | grep -q 1 \
+          || createdb -O llmlens llmlens
+        psql -v ON_ERROR_STOP=1 -d postgres -c "ALTER DATABASE llmlens OWNER TO llmlens"
     networks: ["llmlens"]
     depends_on:
       postgres: { condition: service_healthy }
@@ -156,9 +189,12 @@ services:
       # (`llmlens-server create-project`), then set LLMLENS_API_KEY on the api.
       LLMLENS_PROFILE: ${LLMLENS_PROFILE:-local}
       LLMLENS_CLICKHOUSE_HOST: clickhouse
+      LLMLENS_CLICKHOUSE_PASSWORD: ${LLMLENS_CLICKHOUSE_PASSWORD:-llmlens-local-only}
       # The shared RAG Postgres server (which joins the llmlens network below),
-      # separate `llmlens` database — created by llmlens-db-init.
-      LLMLENS_POSTGRES_DSN: postgresql://${POSTGRES_USER:-graphrag}:${GRAPHRAG_POSTGRES_PASSWORD:-change-me}@postgres:5432/llmlens
+      # separate `llmlens` database and dedicated `llmlens` role — both created
+      # by llmlens-db-init. Deliberately NOT the graphrag credentials: this
+      # role cannot read the accounts database.
+      LLMLENS_POSTGRES_DSN: postgresql://llmlens:${LLMLENS_POSTGRES_PASSWORD:-llmlens-local-only}@postgres:5432/llmlens
       LLMLENS_REDIS_URL: redis://redis:6379/0
       LLMLENS_ADMIN_KEY: ${LLMLENS_ADMIN_KEY:-change-me-admin}
     networks:

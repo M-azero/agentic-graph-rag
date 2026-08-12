@@ -1,6 +1,6 @@
 import clsx from "clsx";
 import { MessageSquarePlus, Trash2 } from "lucide-react";
-import { useMemo } from "react";
+import { useMemo, type ReactNode } from "react";
 
 import type { ThreadInfo } from "../../api";
 import { Button, Skeleton } from "../ui";
@@ -41,6 +41,7 @@ export function ThreadSidebar({
   threads,
   activeId,
   loading,
+  header,
   onSelect,
   onCreate,
   onDelete,
@@ -48,6 +49,10 @@ export function ThreadSidebar({
   threads: ThreadInfo[];
   activeId: string | null;
   loading: boolean;
+  /** Rendered above the list. The shelf picker goes here: it scopes the whole
+   *  list, since a conversation belongs to exactly one shelf. Kept a slot
+   *  rather than a prop so this component stays about conversations. */
+  header?: ReactNode;
   onSelect: (id: string) => void;
   onCreate: () => void;
   onDelete: (id: string) => void;
@@ -56,6 +61,7 @@ export function ThreadSidebar({
 
   return (
     <aside className="flex w-64 shrink-0 flex-col border-r border-border bg-surface">
+      {header && <div className="border-b border-border p-2">{header}</div>}
       <div className="min-h-0 flex-1 overflow-y-auto px-2 py-3">
         {loading ? (
           <div className="space-y-1.5 px-1">

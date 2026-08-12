@@ -19,10 +19,22 @@ Two design points carry the correctness:
   main chat path, the meter estimates from the prompt text it already sees and
   keeps the estimate only when the provider says nothing. Unmetered is the one
   outcome worth ruling out.
+
+* **It travels in a ContextVar, beside the source sink and the retrieval plan.**
+  The agent's own calls get the meter through LangGraph's config, but the
+  reranker is not part of the graph — it is called from inside a tool, several
+  thread pools deep, and under a generative provider it makes one model call per
+  candidate. Threading a `config=` argument down through `HybridRetriever` and
+  the `Reranker` interface would put metering in four signatures that have
+  nothing else to do with it; `use_meter()` binds it once where the run starts.
 """
 
 from __future__ import annotations
 
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any
 
 from langchain_core.callbacks import AsyncCallbackHandler
@@ -34,7 +46,13 @@ log = get_logger(__name__)
 
 
 class TokenMeter(AsyncCallbackHandler):
-    """Accumulates prompt/completion tokens across every model call in one run."""
+    """Accumulates prompt/completion tokens across every model call in one run.
+
+    Thread-safe, which is not optional here: the hybrid retriever runs its three
+    legs concurrently and the generative reranker scores candidates on a pool of
+    four, so several `on_llm_end` callbacks land at once. `self.x += n` is a
+    load-add-store, and losing one of those silently undercounts a bill.
+    """
 
     # LangChain skips handlers that raise; being explicit that a metering fault
     # must never surface as a failed answer.
@@ -47,23 +65,28 @@ class TokenMeter(AsyncCallbackHandler):
         self.reported = False  # True once any provider gave real usage
         self._estimated_input = 0
         self._estimated_output = 0
+        self._lock = threading.Lock()
 
     # -- prompt side ----------------------------------------------------------
     async def on_chat_model_start(
         self, serialized: dict, messages: list[list[Any]], **kwargs: Any
     ) -> None:
         """Every model call, including the tool-loop turns that resend context."""
-        self.calls += 1
-        self._estimated_input += sum(
+        estimate = sum(
             estimate_tokens(_text_of(m)) for batch in messages for m in batch
         )
+        with self._lock:
+            self.calls += 1
+            self._estimated_input += estimate
 
     async def on_llm_start(
         self, serialized: dict, prompts: list[str], **kwargs: Any
     ) -> None:
         """Completion-style models, for the same reason."""
-        self.calls += 1
-        self._estimated_input += sum(estimate_tokens(p) for p in prompts)
+        estimate = sum(estimate_tokens(p) for p in prompts)
+        with self._lock:
+            self.calls += 1
+            self._estimated_input += estimate
 
     # -- the authoritative numbers, when the provider sends them --------------
     async def on_llm_end(self, response: Any, **kwargs: Any) -> None:
@@ -83,12 +106,15 @@ class TokenMeter(AsyncCallbackHandler):
             got_output = int(raw.get("completion_tokens") or 0)
 
         if got_input or got_output:
-            self.reported = True
-            self.input_tokens += got_input
-            self.output_tokens += got_output
+            with self._lock:
+                self.reported = True
+                self.input_tokens += got_input
+                self.output_tokens += got_output
         else:
             # Streamed call with no usage block: keep this turn's estimate.
-            self._estimated_output += estimate_tokens(_response_text(response))
+            estimate = estimate_tokens(_response_text(response))
+            with self._lock:
+                self._estimated_output += estimate
 
     # -- what the caller books ------------------------------------------------
     @property
@@ -99,10 +125,54 @@ class TokenMeter(AsyncCallbackHandler):
         views rather than adding them, since the estimate covers calls the
         provider may already have counted.
         """
-        return (
-            max(self.input_tokens, self._estimated_input),
-            max(self.output_tokens, self._estimated_output),
-        )
+        with self._lock:
+            return (
+                max(self.input_tokens, self._estimated_input),
+                max(self.output_tokens, self._estimated_output),
+            )
+
+
+_METER: ContextVar[TokenMeter | None] = ContextVar("graphrag_token_meter", default=None)
+
+
+def active_meter() -> TokenMeter | None:
+    """The meter bound to the work in flight, or None outside a metered run.
+
+    None is a real answer, not a failure: the CLI, scripts and tests call the
+    retrievers directly and have nothing to bill.
+    """
+    return _METER.get()
+
+
+def meter_config(base: dict | None = None) -> dict:
+    """A LangChain `config` carrying the bound meter, for components outside the
+    agent graph. Returns `base` unchanged when nothing is bound.
+
+    Sync `.invoke()` is fine: LangChain's synchronous callback manager runs
+    coroutine handlers itself, so an `AsyncCallbackHandler` still fires for the
+    reranker's blocking calls.
+    """
+    meter = _METER.get()
+    if meter is None:
+        return dict(base or {})
+    config = dict(base or {})
+    config["callbacks"] = [*config.get("callbacks", []), meter]
+    return config
+
+
+@contextmanager
+def use_meter(meter: TokenMeter | None) -> Iterator[TokenMeter | None]:
+    """Bind a meter for the duration of one request's model work.
+
+    Must be entered by whatever *drives* the work, not by a node inside it:
+    LangGraph copies the context at submit time, so anything bound later is
+    invisible to the tools.
+    """
+    token = _METER.set(meter)
+    try:
+        yield meter
+    finally:
+        _METER.reset(token)
 
 
 def _text_of(message: Any) -> str:

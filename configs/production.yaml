@@ -1,4 +1,4 @@
-# Production profile: cloud APIs only, sized for a small VPS (2 vCPU / 8 GB).
+# Production profile: cloud APIs only, sized for a single VPS (4 vCPU / 12 GB).
 # No torch, no local models. Set the matching keys in .env:
 #   DEEPSEEK_API_KEY   (chat + extraction default, rerank fallback)
 #   DEEPINFRA_TOKEN    (chat fallbacks, OCR, rerank fallback, guard judge)
@@ -127,13 +127,52 @@ storage:
     duckdb_dir: data/vectors
     memory_limit_mb: 256
 
+chunking:
+  # Pick the strategy per document rather than using one for the whole corpus:
+  # token windows for tabular files (recursive's sentence separators do nothing
+  # in a CSV, and a split mid-record is worse), recursive where there are real
+  # headings, semantic for OCR'd prose that arrives as one wall of text.
+  # Deterministic — no model call — and `strategy` above stays the fallback
+  # whenever no signal fires.
+  #
+  # Affects future ingests only. Existing chunks keep whatever strategy built
+  # them; re-chunking a document means re-ingesting it.
+  route_per_document: true
+
 agent:
   memory: true
   memory_backend: postgres  # chat memory in Postgres (Phase 2); redis for dev
 
+  # Check the answer before returning it. The free half — parsing the answer's
+  # [source: ...] tags and comparing them against what retrieval actually
+  # returned — runs regardless; this enables the model-backed half.
+  review:
+    enabled: true
+    # The critic only runs when the free check cannot settle the answer: a
+    # cleanly-cited short answer after one tool call skips it entirely, which
+    # is what keeps this close to cost-neutral. A correct refusal skips it too.
+    critic_free_tool_calls: 1
+    critic_free_chars: 1200
+    # One extra research pass when the critic can name what is missing. It
+    # tries the :NEXT chain around chunks already retrieved before paying for a
+    # fresh embedding + rerank, so the common case is one graph hop.
+    #
+    # NOTE: this roughly doubles the worst-case cost of a hard question. The
+    # shipped ceiling was raised to match (migration 0003), but a deployment
+    # that lowered `global_limits.tokens_per_day` keeps its own value — check
+    # it before turning this up.
+    max_rounds: 1
+    window_before: 1
+    window_after: 1
+
 ingestion:
   # Ingest runs in-process on the API box; keep extraction from starving chat.
-  max_concurrency: 2
+  # 3 on a 4 vCPU box (API_CPU_LIMIT=3): the work is I/O-bound — cloud
+  # embedding and extraction — so this is really a cap on concurrent provider
+  # calls, and raising it further hits provider rate limits before it hits CPU.
+  # Uploads are still serialised one at a time by the API's ingest semaphore;
+  # this is the fan-out *within* a single job.
+  max_concurrency: 3
 
 # --- Integrated features (see docs/INTEGRATIONS.md) ---------------------------
 safety:
@@ -147,8 +186,9 @@ safety:
   timeout_s: 12.0
 observability:
   # OFF: llmlens is not deployed on this box (it needs ClickHouse + its own
-  # Redis + api/worker, roughly another 4.7 GB, which does not fit alongside
-  # the RAG stack on 8 GB). Turn it on only with the observability profile up.
+  # Redis + api/worker, roughly another 4.6 GB — which on top of this stack's
+  # 7.6 GB of caps still overruns 12 GB). Turn it on only with the
+  # observability profile up, on a box with room for it.
   enabled: false
 
 api:
@@ -158,6 +198,15 @@ api:
   # they take and what they return. Read the docs on a dev instance, or open an
   # SSH tunnel to :8000 where the proxy is not in the path.
   docs_enabled: false
+
+  # Answers come back in one response rather than streamed. Streaming skips the
+  # review loop entirely — once tokens are on the wire the answer cannot be
+  # repaired or withheld — so a client that merely omits `stream` would silently
+  # opt out of citation review. The shipped frontend already hardcodes
+  # `stream: false` for the same reason (frontend/src/api.ts). A caller can
+  # still ask for `stream: true` and gets the free deterministic checks plus an
+  # advisory `verification` event.
+  stream: false
   # Admin-gated: /metrics maps every route, its traffic and its error rates.
   # A scraper sends X-Admin-Key, or scrapes the container directly in-network.
   metrics_public: false

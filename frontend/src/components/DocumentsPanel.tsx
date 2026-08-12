@@ -21,7 +21,20 @@ interface Job {
   chunks?: number;
 }
 
-export function DocumentsPanel({ onClose }: { onClose: () => void }) {
+export function DocumentsPanel({
+  onClose,
+  shelfId,
+  shelfName,
+  onChanged,
+}: {
+  onClose: () => void;
+  /** Which shelf's documents to show and upload into. Null is the default shelf. */
+  shelfId: string | null;
+  shelfName: string;
+  /** Fires after an upload finishes or a document is deleted, so the shelf
+   *  picker's per-shelf counts stay honest. */
+  onChanged?: () => void;
+}) {
   const [files, setFiles] = useState<StoredFile[]>([]);
   const [used, setUsed] = useState(0);
   const [limit, setLimit] = useState(0);
@@ -34,8 +47,10 @@ export function DocumentsPanel({ onClose }: { onClose: () => void }) {
 
   const refresh = useCallback(async () => {
     try {
-      const data = await listFiles();
+      const data = await listFiles(shelfId);
       setFiles(data.files);
+      // Account-wide, not per shelf — the file quota is held once across all of
+      // them, so "3/10" has to mean the same thing on every shelf.
       setUsed(data.used);
       setLimit(data.limit);
     } catch (err) {
@@ -43,9 +58,14 @@ export function DocumentsPanel({ onClose }: { onClose: () => void }) {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [shelfId]);
 
+  // Re-reads when the shelf changes, and clears the previous shelf's in-flight
+  // job list — those jobs belong to documents this panel no longer shows.
   useEffect(() => {
+    setLoading(true);
+    setJobs([]);
+    setError("");
     void refresh();
   }, [refresh]);
 
@@ -73,14 +93,17 @@ export function DocumentsPanel({ onClose }: { onClose: () => void }) {
           );
           // A partial ingest still stored its chunks, so the file list needs
           // refreshing exactly as it does for a clean one.
-          if (status.status === "done" || status.status === "partial") void refresh();
+          if (status.status === "done" || status.status === "partial") {
+            void refresh();
+            onChanged?.();
+          }
         } catch {
           /* a transient poll failure resolves on the next tick */
         }
       }
     }, POLL_MS);
     return () => clearInterval(timer);
-  }, [jobs, refresh]);
+  }, [jobs, refresh, onChanged]);
 
   async function upload(fileList: FileList | null) {
     if (!fileList?.length) return;
@@ -91,7 +114,7 @@ export function DocumentsPanel({ onClose }: { onClose: () => void }) {
       const placeholder: Job = { id: `pending-${file.name}`, name: file.name, status: "uploading" };
       setJobs((prev) => [...prev, placeholder]);
       try {
-        const { job_id } = await uploadFile(file);
+        const { job_id } = await uploadFile(file, shelfId);
         setJobs((prev) =>
           prev.map((j) =>
             j.id === placeholder.id ? { ...j, id: job_id, status: "queued" } : j,
@@ -109,6 +132,7 @@ export function DocumentsPanel({ onClose }: { onClose: () => void }) {
     try {
       await deleteFile(fileId);
       await refresh();
+      onChanged?.();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not delete the document.");
     }
@@ -119,10 +143,14 @@ export function DocumentsPanel({ onClose }: { onClose: () => void }) {
   return (
     <aside className="flex w-80 shrink-0 flex-col border-l border-border bg-surface">
       <header className="flex h-12 items-center justify-between border-b border-border px-4">
-        <h2 className="text-sm font-semibold text-strong">Documents</h2>
-        <div className="flex items-center gap-2">
+        {/* Named, because an upload here lands on this shelf and nowhere else —
+            the header is what makes that visible before the file is dropped. */}
+        <h2 className="min-w-0 truncate text-sm font-semibold text-strong" title={shelfName}>
+          {shelfName}
+        </h2>
+        <div className="flex shrink-0 items-center gap-2">
           {limit > 0 && (
-            <span className="font-mono text-2xs text-muted">
+            <span className="font-mono text-2xs text-muted" title="Documents used across all shelves">
               {used}/{limit}
             </span>
           )}
@@ -164,7 +192,9 @@ export function DocumentsPanel({ onClose }: { onClose: () => void }) {
           <p className="text-sm font-medium text-body">
             {atLimit ? "Document limit reached" : "Drop files or click to upload"}
           </p>
-          <p className="mt-0.5 text-2xs text-muted">PDF, Word, text, CSV, images</p>
+          <p className="mt-0.5 text-2xs text-muted">
+            {atLimit ? "PDF, Word, text, CSV, images" : `Adds to “${shelfName}”`}
+          </p>
           <input
             ref={inputRef}
             type="file"

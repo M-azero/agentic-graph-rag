@@ -11,6 +11,7 @@ from __future__ import annotations
 import abc
 import re
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 
 from graphrag.config.settings import RerankCfg, Secrets
 from graphrag.core.errors import ConfigError, ProviderError
@@ -18,6 +19,7 @@ from graphrag.core.logging import get_logger
 from graphrag.core.messages import content_to_text
 from graphrag.core.types import RetrievedChunk
 from graphrag.llm.factory import build_chat_chain
+from graphrag.usage.meter import meter_config
 
 log = get_logger(__name__)
 
@@ -113,7 +115,13 @@ class LLMReranker(Reranker):
 
     def _score(self, query: str, text: str) -> float | None:
         try:
-            reply = self._llm.invoke(self.cfg.prompt.format(query=query, document=text))
+            # Metered. One call per candidate means a generative rerank is often
+            # the largest single line on a question's bill — larger than the
+            # answer — and it used to be invisible to the quota entirely.
+            reply = self._llm.invoke(
+                self.cfg.prompt.format(query=query, document=text),
+                config=meter_config(),
+            )
         except Exception as exc:
             log.warning("rerank_call_failed", error=str(exc), model=self.cfg.model)
             return None
@@ -127,8 +135,21 @@ class LLMReranker(Reranker):
     def rerank(self, query, chunks, top_k):
         if not chunks:
             return []
+        # Each worker gets its own context copy, so the bound token meter is
+        # visible inside the scoring calls — a bare `pool.map` runs them under an
+        # empty context and the whole rerank goes unmetered.
+        #
+        # `copy_context()` is called HERE, in the submitting thread, and the
+        # bound method is passed to the pool. Calling it inside the submitted
+        # callable instead copies the *worker's* context, which is empty, and
+        # looks identical from the outside while metering nothing. One copy per
+        # candidate because a single Context cannot be entered concurrently.
         with ThreadPoolExecutor(max_workers=max(1, self.cfg.concurrency)) as pool:
-            scores = list(pool.map(lambda c: self._score(query, c.text), chunks))
+            futures = [
+                pool.submit(copy_context().run, self._score, query, c.text)
+                for c in chunks
+            ]
+            scores = [f.result() for f in futures]
 
         pairs = list(zip(chunks, scores, strict=True))
         ranked = sorted(

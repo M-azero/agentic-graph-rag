@@ -28,10 +28,13 @@ export interface StoredFile {
   file_id: string;
   name: string;
   source: string;
+  shelf_id: string | null;
 }
 
 export interface FileList {
   files: StoredFile[];
+  // Account-wide, even when the list is narrowed to one shelf: the file quota
+  // is held once across every shelf.
   used: number;
   limit: number;
 }
@@ -42,6 +45,27 @@ export interface ModelOption {
   provider: string;
 }
 
+/** One job the assistant can do. Served by the API so this list never has to
+ *  be kept in sync by hand. */
+export interface PresetOption {
+  id: string;
+  label: string;
+  emoji: string;
+  description: string;
+}
+
+/** A subject: its own documents, its own knowledge graph. `id` is null for the
+ *  implicit default shelf of an account with no rows yet — send it back as-is,
+ *  since null means "the default shelf" everywhere on the server. */
+export interface ShelfInfo {
+  id: string | null;
+  name: string;
+  slug: string;
+  preset: string;
+  is_default: boolean;
+  files: number;
+}
+
 export interface Me {
   user_id: string;
   email: string;
@@ -50,6 +74,7 @@ export interface Me {
   authenticated: boolean;
   models: ModelOption[];
   default_model: string;
+  presets: PresetOption[];
 }
 
 export interface ThreadInfo {
@@ -57,6 +82,9 @@ export interface ThreadInfo {
   title: string;
   created_at: string;
   updated_at: string;
+  // Fixed when the conversation is created; the server ignores any other shelf
+  // sent with a question on this thread.
+  shelf_id: string | null;
 }
 
 export interface MessageInfo {
@@ -177,10 +205,11 @@ export interface QueryResult {
 // token-by-token rendering for a firm safety guarantee plus a verdict to display.
 export async function queryOnce(
   question: string,
-  style: string,
+  preset: string,
   threadId: string,
   model?: string,
   signal?: AbortSignal,
+  shelfId?: string | null,
 ): Promise<QueryResult> {
   const res = await fetch(`${API}/query`, {
     method: "POST",
@@ -188,10 +217,13 @@ export async function queryOnce(
     headers: headers({ "Content-Type": "application/json" }),
     body: JSON.stringify({
       question,
-      style,
+      preset,
       thread_id: threadId,
       stream: false,
       ...(model ? { model } : {}),
+      // Only read for the first turn of a new conversation — after that the
+      // thread's own shelf wins, so a stale picker can't redirect a question.
+      ...(shelfId ? { shelf_id: shelfId } : {}),
     }),
     signal,
   });
@@ -258,7 +290,8 @@ export const auth = {
 
 export const threads = {
   list: () => request<{ threads: ThreadInfo[] }>("/threads"),
-  create: (title = "New chat") => request<ThreadInfo>("/threads", json({ title })),
+  create: (title = "New chat", shelfId?: string | null) =>
+    request<ThreadInfo>("/threads", json({ title, shelf_id: shelfId ?? null })),
   rename: (id: string, title: string) =>
     request<ThreadInfo>(`/threads/${id}`, {
       method: "PATCH",
@@ -270,12 +303,40 @@ export const threads = {
     request<{ thread: ThreadInfo; messages: MessageInfo[] }>(`/threads/${id}/messages`),
 };
 
+// -- shelves ------------------------------------------------------------------
+
+export const shelves = {
+  list: () => request<{ shelves: ShelfInfo[]; max_shelves: number }>("/shelves"),
+  create: (name: string, preset: string) =>
+    request<ShelfInfo>("/shelves", json({ name, preset })),
+  update: (id: string, patch: { name?: string; preset?: string }) =>
+    request<ShelfInfo>(`/shelves/${id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(patch),
+    }),
+  // Destructive: takes the shelf's documents and its whole knowledge graph
+  // with it. The caller confirms first.
+  remove: (id: string) =>
+    request<{ id: string; chunks_removed: number; files_removed: number }>(
+      `/shelves/${id}`,
+      { method: "DELETE" },
+    ),
+};
+
 // -- documents ----------------------------------------------------------------
 
-export async function uploadFile(file: File): Promise<{ job_id: string }> {
+export async function uploadFile(
+  file: File,
+  shelfId?: string | null,
+): Promise<{ job_id: string }> {
   const form = new FormData();
   form.append("file", file);
-  return request<{ job_id: string }>("/ingest/upload", { method: "POST", body: form });
+  const query = shelfId ? `?shelf_id=${encodeURIComponent(shelfId)}` : "";
+  return request<{ job_id: string }>(`/ingest/upload${query}`, {
+    method: "POST",
+    body: form,
+  });
 }
 
 export const ingestStatus = (jobId: string) =>
@@ -283,7 +344,10 @@ export const ingestStatus = (jobId: string) =>
     `/ingest/${jobId}`,
   );
 
-export const listFiles = () => request<FileList>("/ingest/files");
+export const listFiles = (shelfId?: string | null) =>
+  request<FileList>(
+    shelfId ? `/ingest/files?shelf_id=${encodeURIComponent(shelfId)}` : "/ingest/files",
+  );
 
 export const deleteFile = (fileId: string) =>
   request<{ chunks_removed: number }>(`/ingest/files/${fileId}`, { method: "DELETE" });

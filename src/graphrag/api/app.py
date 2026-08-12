@@ -119,6 +119,12 @@ async def _csrf_guard(request: Request, call_next):
 # Health/readiness/metrics poll every few seconds and would bury everything else.
 _QUIET_PATHS = {"/health", "/ready", "/metrics"}
 
+# Passwords that mean "nobody chose one". The settings default and the empty
+# string were checked; `12345678` was not, and it is the value
+# `docker-compose.yml` substitutes into NEO4J_AUTH when the operator never set
+# GRAPHRAG_NEO4J_PASSWORD — i.e. the one that actually ships.
+_WEAK_PASSWORDS = frozenset({"please-change-me", "", "12345678", "change-me", "password", "neo4j"})
+
 
 async def _log_requests(request: Request, call_next):
     """One line in, one line out, per request.
@@ -224,11 +230,46 @@ async def _init_agent_memory(app: FastAPI, container: Container) -> None:
     app.state.checkpoint_pool = None
 
 
+ENABLED_MODELS_KEY = "enabled_models"
+
+
+async def _load_enabled_models(app: FastAPI) -> list[str] | None:
+    """The admin's chat-model narrowing, or None when they have not set one.
+
+    Held on `app.state` rather than read per request: it is consulted on the
+    hot path by /query, and this process is single-worker by construction (the
+    DuckDB vector provider takes an exclusive lock per tenant file), so the
+    admin router can keep it current by writing back to the same object.
+    """
+    db = app.state.db
+    if db is None:
+        return None
+    from sqlalchemy import select
+
+    from graphrag.db.engine import session_scope
+    from graphrag.db.models import AppSetting
+
+    try:
+        async with session_scope(db) as s:
+            row = (
+                await s.execute(
+                    select(AppSetting).where(AppSetting.key == ENABLED_MODELS_KEY)
+                )
+            ).scalar_one_or_none()
+    except Exception as exc:
+        log.warning("enabled_models_unavailable", error=str(exc))
+        return None
+    if row is None or not isinstance(row.value, dict):
+        return None
+    stored = row.value.get("enabled")
+    return list(stored) if isinstance(stored, list) and stored else None
+
+
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     container: Container = app.state.container
 
-    if container.secrets.neo4j_password in ("please-change-me", ""):
+    if container.secrets.neo4j_password in _WEAK_PASSWORDS:
         log.warning("weak_neo4j_password", hint="set GRAPHRAG_NEO4J_PASSWORD in .env")
 
     app.state.checkpoint_pool = None
@@ -280,6 +321,8 @@ async def _lifespan(app: FastAPI):
                 )
         except Exception as exc:
             log.warning("admin_bootstrap_failed", error=str(exc))
+
+    app.state.enabled_models = await _load_enabled_models(app)
 
     await _init_agent_memory(app, container)
 
@@ -372,6 +415,10 @@ def create_app(container: Container | None = None) -> FastAPI:
     app.state.db_engine = None
     app.state.arq = None
     app.state.checkpoint_pool = None
+    # None = no admin narrowing, so `llm.allowed` stands. Seeded here as well as
+    # in the lifespan so a model override resolves the same way in tests and
+    # scripts, where the lifespan has not run.
+    app.state.enabled_models = None
     from graphrag.limits import LimitService
 
     app.state.limits = LimitService(None, container.redis)
@@ -435,6 +482,7 @@ def create_app(container: Container | None = None) -> FastAPI:
         ingest,
         query,
         search,
+        shelves,
         threads,
         users,
     )
@@ -443,6 +491,7 @@ def create_app(container: Container | None = None) -> FastAPI:
     app.include_router(auth.router)
     app.include_router(admin.router)
     app.include_router(users.router)
+    app.include_router(shelves.router)
     app.include_router(threads.router)
     app.include_router(ingest.router)
     app.include_router(query.router)

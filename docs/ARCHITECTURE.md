@@ -121,11 +121,100 @@ cache is an LRU bounded by `tenancy.max_active_tenants` — evicting a tenant fr
 only wrappers; the models stay resident.
 
 **How isolation works.** By default, every node a user ingests is tagged with a
-`corpus` equal to their user id, and every query filters on it — so one Neo4j
-database (Community-friendly) cleanly separates users. Set
+`corpus`, and every query filters on it — so one Neo4j database
+(Community-friendly) cleanly separates users. Set
 `tenancy.per_tenant_database: true` to instead give each user a real Neo4j
-database (Enterprise). Conversation memory threads are namespaced `"{user}:{thread}"`,
-so history never leaks across accounts.
+database (Enterprise). Conversation memory threads are namespaced
+`"{corpus}:{thread}"`, so history never leaks across accounts.
+
+## Shelves — one account, several knowledge bases
+
+A maths textbook and a programming manual are two subjects, not one corpus. Left
+in the same namespace they actively corrupt each other: entity resolution merges
+the "function" of each into a single node, community summaries describe an
+incoherent blend of both, and graph traversal walks from integration into
+closures. A **shelf** is the boundary that prevents it — and it reuses the
+boundary already there rather than adding a second one:
+
+```
+corpus = tenant_id                  # the default shelf
+corpus = tenant_id + "." + slug     # every other shelf
+```
+
+That one line is the whole mechanism. Neo4j's `(corpus, key)` constraints, the
+DuckDB filename, and the checkpointer's thread namespace all key on the corpus
+string, so each shelf gets its own entities, its own community summaries, its own
+vector file and its own conversation memory — with no changes to a single Cypher
+query.
+
+Two properties are load-bearing:
+
+- **The separator is a dot**, because `sanitize_user` and `sanitize_slug` both
+  strip it. Neither a tenant id nor a slug can contain one, so `{tenant}.{slug}`
+  is unambiguous. A dash would not have been: tenant ids legitimately contain
+  dashes, so `alice-1-b-2` could be read as two different (tenant, shelf) pairs.
+- **The default shelf's slug is empty**, so its corpus is the bare tenant id —
+  which is exactly where everything ingested before shelves existed already
+  lives. The migration therefore moves no data at all; it gives a name to what is
+  already in place.
+
+A question searches **one** shelf. Which one comes from the conversation, not the
+request: a thread is pinned to its shelf at creation and the server reads
+`Thread.shelf_id` on every turn, because the agent's memory for that thread is
+keyed on the shelf's corpus — a thread that moved would lose its history and
+start citing passages its own transcript never mentioned.
+
+Quotas stay **per account**. Files and storage are counted over all shelves by
+the query that reserves the slot; the chunk ceiling needs more care, since
+`IngestPipeline._check_capacity` can only count the corpus it is writing to. The
+API closes that by passing `max_chunks` already reduced by what the user's other
+shelves hold, which makes the pipeline's per-corpus check equivalent to the
+per-account rule. Otherwise four shelves would buy four times the allowance.
+
+## Presets — ten jobs over the same retrieval
+
+`SYSTEM_PROMPT` has exactly one substitution point, `{style}`, and it is filled
+server-side from an enum. A **preset** fills that same slot with a working
+method instead of a phrasing: what a finance question needs surfaced (figures
+with their period and units, and never arithmetic of your own) is not what a
+teaching question needs (build up from the definition, one flagged analogy).
+
+The text lives in **`prompts/*.md`**, not in Python. Prompts are content: they
+get revised far more often than the code around them, they are the thing a
+non-Python reader most needs access to, and a diff of one should not be a diff
+of a source file. The directory is resolved exactly as `configs/` is (checkout,
+else cwd, else `GRAPHRAG_PROMPT_DIR`, which the image pins), read once and
+cached — a prompt changing under a running process would mean two questions in
+one conversation answered under different instructions.
+
+Presets are chosen in the composer and stored as each shelf's default, so opening
+the maths shelf selects Study without anyone re-picking it. Three properties keep
+them safe to put inside a hardened prompt:
+
+- **Server-side only.** A request names a preset *id*; `canonical_preset` clamps
+  it to the enum before anything is looked up, so request text never reaches the
+  prompt — and the clamp doubles as the agent cache key, so junk cannot mint
+  entries.
+- **They narrow, never widen.** No preset grants outside knowledge, relaxes the
+  citation requirement, or offers an escape from the closed-domain refusal.
+  `test_presets.py` asserts this against a list of permissive phrasings, because
+  it is the tempting edit — telling the finance preset to "calculate the ratio"
+  would quietly undo the contract above it.
+- **`general` still carries `AnswerStyle`.** Its body ends on a
+  `## Length and register` heading with nothing under it, and the style
+  instruction is what goes there — so a caller that sends no preset (the CLI, an
+  API key holder, an older UI build) still gets style-controlled phrasing
+  exactly as before.
+
+A job preset *replaces* the style instruction rather than stacking on it. Both
+control the same axis, and "thorough, explain the reasoning" alongside "tight
+bullets, front-loaded" is a contradiction the model resolves at random.
+
+**The cost is real.** A preset body is ~550-650 tokens, and the agent's tool loop
+resends the system prompt every turn — so a preset adds roughly 2-4k prompt
+tokens to a question, against the ~10k a question already costs. The token
+quotas in `db/models.GlobalLimit` were sized before this; a deployment that runs
+close to them should expect to raise them.
 
 **Request routing.** The API reads `X-User-Id`; `Container.tenant(user)` resolves
 (and lazily prepares) that user's namespace, reusing the shared models. The CLI

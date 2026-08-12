@@ -58,3 +58,27 @@ def test_missing_client_is_survivable():
     """ASGI transports without a peer (in-process tests, some servers) must not
     raise out of a rate-limit check."""
     assert client_ip(_request(client=None)) == "127.0.0.1"
+
+
+def test_headers_from_a_public_peer_are_ignored():
+    """The bundled proxy lives on the compose network, so a public peer address
+    means the request did NOT come through it — the API itself is exposed and
+    the forwarding headers are the caller's own invention. Honoring them would
+    hand out a fresh rate-limit bucket per request and let the caller forge the
+    address recorded against every session.
+
+    A genuinely public peer, not a 198.51.100.x documentation address — the
+    stdlib files the RFC 5737 ranges under `is_private`, so a doc address here
+    would exercise the *trusted* path and pass for the wrong reason."""
+    req = _request(
+        {"X-Real-IP": "203.0.113.7", "X-Forwarded-For": "1.2.3.4, 10.0.0.5"},
+        client=("142.250.72.14", 40000),
+    )
+    assert client_ip(req) == "142.250.72.14"
+
+
+def test_headers_from_a_nameless_peer_are_ignored():
+    """A peer that is not an IP at all (some in-process transports) is not our
+    proxy either; its headers get the same treatment as a public caller's."""
+    req = _request({"X-Real-IP": "203.0.113.7"}, client=("testclient", 123))
+    assert client_ip(req) == "testclient"

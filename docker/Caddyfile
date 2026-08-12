@@ -88,10 +88,15 @@
 	# API — strip the /api prefix and forward to the backend.
 	handle_path /api/* {
 		# Replaces the upload cap the frontend's nginx used to hold. Keep it
-		# >= api.max_upload_mb, or a large upload dies as a bare 413 before the
-		# API can apply its own limit and say something useful.
+		# strictly ABOVE api.max_upload_mb, or a large upload dies as a bare
+		# 413 before the API can apply its own limit and say something useful.
+		#
+		# Strictly above, because the two limits measure different things:
+		# this is the whole multipart BODY, the API's is the file inside it.
+		# Equal values refuse a file of exactly the advertised size, because
+		# the boundaries and part headers carry it past the cap.
 		request_body {
-			max_size {$MAX_UPLOAD_MB:25}MB
+			max_size {$MAX_UPLOAD_MB:26}MB
 		}
 		reverse_proxy api:8000 {
 			# Disable response buffering so SSE streaming works.

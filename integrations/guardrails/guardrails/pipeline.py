@@ -276,7 +276,14 @@ class GuardPipeline:
         return scores, evidence, block_cats
 
     def _should_judge(self, policy: Policy, mode: str, hits: list[RuleHit]) -> bool:
-        if mode == "fast" or not policy.judge.enabled or policy.judge.trigger == "never":
+        # `mode` arrives in the request body, so honouring it lets the caller
+        # decide how hard it is screened — `{"mode": "fast"}` skips the judge and
+        # leaves only the regex rules. Gated behind a server setting rather than
+        # trusted outright; the policy's own `judge.trigger` is the server-side
+        # control and stays authoritative either way.
+        if mode == "fast" and self._settings.allow_client_mode:
+            return False
+        if not policy.judge.enabled or policy.judge.trigger == "never":
             return False
         if policy.judge.trigger == "on_rule_flag" and not hits:
             return False

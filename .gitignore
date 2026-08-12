@@ -16,12 +16,59 @@ dist/
 .env.bak
 .env.*.local
 
+# Credentials and keys, by shape rather than by name. Nothing matching these has
+# ever been committed here — the point is that nothing ever is, including the
+# file someone drops in at 2am during an incident and forgets about.
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+*.kdbx
+secrets/
+.secrets/
+
+# Database dumps and embedded stores. A dump of this system's Postgres carries
+# every account row and password hash; a `.duckdb` file is one tenant's whole
+# vector index. Both are the kind of thing that gets written next to the code
+# "just for a minute" during a restore.
+*.sql
+*.dump
+*.sqlite
+*.sqlite3
+*.duckdb
+*.duckdb.wal
+
+# Editor and tooling backups. `.env.bak` is already named above, but the same
+# accident with any other name — `docker-compose.yml~`, `Caddyfile.orig` — puts
+# a working copy of a real config in the repo.
+*~
+*.orig
+*.rej
+*.swp
+
 # Personal / deployment-specific notes. This repo is public: the docs teach how
 # to self-host the system, and nothing here should identify where *this* copy of
 # it runs. Untracked alone isn't enough — one `git add .` publishes it.
 ONBOARDING.md
 NOTES.md
 notes/
+
+# Operational material for *this* deployment. None of it contains a secret, but
+# together it describes the security posture of a specific running box — which
+# ports are closed, what the SSH policy is, what is monitored and what is not.
+# That is a map for someone probing the host, and it is worth exactly nothing to
+# a reader who just wants to self-host the project. `docs/DEPLOYMENT.md` stays
+# public and covers everything they actually need.
+docs/HARDENING.md
+scripts/harden-host.sh
+
+# Internal planning. Roadmaps read as commitments to people who find them.
+docs/MULTI-AGENT-PLAN.md
+docs/*-PLAN.md
+TODO.md
 
 # Data & models
 # Ignore ingested/uploaded content, but ship the sample corpus the README's

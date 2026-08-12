@@ -12,17 +12,14 @@ from graphrag.ingestion.chunking.token import TokenChunker
 from graphrag.ingestion.chunking.tokenizer import TokenCounter, load_hf_tokenizer
 
 
-def build_chunker(
-    cfg: ChunkingCfg, embed_cfg: EmbeddingCfg, embedder: Embedder | None = None
+def _make(
+    strategy: str, cfg: ChunkingCfg, tokenizer, counter, embedder: Embedder | None
 ) -> Chunker:
-    tokenizer = load_hf_tokenizer(embed_cfg.tokenizer or embed_cfg.model)
-    counter = TokenCounter(tokenizer)
-
-    if cfg.strategy == "token":
+    if strategy == "token":
         return TokenChunker(tokenizer, cfg.max_tokens, cfg.overlap)
-    if cfg.strategy == "recursive":
+    if strategy == "recursive":
         return RecursiveChunker(counter, cfg.max_tokens, cfg.overlap, tokenizer)
-    if cfg.strategy == "semantic":
+    if strategy == "semantic":
         if embedder is None:
             raise ConfigError("Semantic chunking needs an embedder")
         return SemanticChunker(
@@ -32,7 +29,39 @@ def build_chunker(
             cfg.max_tokens,
             cfg.semantic.min_chunk_tokens,
         )
-    raise ConfigError(f"Unknown chunking strategy: {cfg.strategy}")
+    raise ConfigError(f"Unknown chunking strategy: {strategy}")
 
 
-__all__ = ["Chunker", "build_chunker"]
+def build_chunker(
+    cfg: ChunkingCfg, embed_cfg: EmbeddingCfg, embedder: Embedder | None = None
+) -> Chunker:
+    tokenizer = load_hf_tokenizer(embed_cfg.tokenizer or embed_cfg.model)
+    counter = TokenCounter(tokenizer)
+    return _make(cfg.strategy, cfg, tokenizer, counter, embedder)
+
+
+def build_chunkers(
+    cfg: ChunkingCfg, embed_cfg: EmbeddingCfg, embedder: Embedder | None = None
+) -> dict[str, Chunker]:
+    """Every strategy, sharing one tokenizer.
+
+    The router picks per document, so building through `build_chunker` each time
+    would re-resolve the tokenizer once per file — the expensive part of
+    construction, and pure waste when the answer is always the same tokenizer.
+
+    A strategy that cannot be built is skipped rather than raising: `semantic`
+    needs an embedder, and a deployment without one should still get a router
+    that chooses between the other two instead of failing every ingest.
+    """
+    tokenizer = load_hf_tokenizer(embed_cfg.tokenizer or embed_cfg.model)
+    counter = TokenCounter(tokenizer)
+    built: dict[str, Chunker] = {}
+    for strategy in ("recursive", "token", "semantic"):
+        try:
+            built[strategy] = _make(strategy, cfg, tokenizer, counter, embedder)
+        except ConfigError:
+            continue
+    return built
+
+
+__all__ = ["Chunker", "build_chunker", "build_chunkers"]

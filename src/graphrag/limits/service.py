@@ -249,12 +249,14 @@ class LimitService:
 
 
 # Used only when the database has no limits row at all (e.g. auth disabled).
-# Mirrors the server_default values in migration 0001.
+# Mirrors the server_default values in migrations 0001 and 0003 — the token
+# ceilings were raised in 0003 to cover the extra model calls answer review
+# makes, so changing either one here needs a matching migration.
 _DEFAULTS: dict[str, int] = {
     "messages_per_minute": 6,
     "messages_per_day": 100,
-    "tokens_per_day": 150_000,
-    "tokens_per_month": 2_000_000,
+    "tokens_per_day": 300_000,
+    "tokens_per_month": 4_000_000,
     "max_files": 10,
     "max_file_mb": 15,
     "max_storage_mb": 100,

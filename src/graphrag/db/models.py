@@ -17,6 +17,7 @@ from datetime import datetime
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     CheckConstraint,
     DateTime,
     ForeignKey,
@@ -24,6 +25,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
     func,
 )
 from sqlalchemy.dialects.postgresql import INET, JSONB, UUID
@@ -179,6 +181,13 @@ class GlobalLimit(Base):
     every turn of the agent's tool loop resends the system prompt, the
     conversation and the retrieved chunks. Budget roughly 10k tokens per
     question, not the few hundred the visible answer suggests.
+
+    **Three places state these numbers and they must agree**: the defaults
+    below, the `server_default`s in the migrations, and `limits.service._DEFAULTS`
+    (used when there is no row at all). They did not — the ORM defaults here were
+    5x the other two, so a `global_limits` row created through the ORM rather
+    than by Alembic silently shipped a five-fold quota. `test_limit_defaults.py`
+    now holds all three together.
     """
 
     __tablename__ = "global_limits"
@@ -186,10 +195,10 @@ class GlobalLimit(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
     messages_per_minute: Mapped[int] = mapped_column(Integer, nullable=False, default=6)
     messages_per_day: Mapped[int] = mapped_column(Integer, nullable=False, default=100)
-    # ~10k tokens/question x the 100 messages/day above, with headroom for long
-    # threads (memory grows the prompt every turn) and multi-hop tool loops.
-    tokens_per_day: Mapped[int] = mapped_column(BigInteger, nullable=False, default=1_500_000)
-    tokens_per_month: Mapped[int] = mapped_column(BigInteger, nullable=False, default=20_000_000)
+    # Raised from 150k/2M by migration 0003 to cover the extra model calls answer
+    # review makes; changing either needs a matching migration.
+    tokens_per_day: Mapped[int] = mapped_column(BigInteger, nullable=False, default=300_000)
+    tokens_per_month: Mapped[int] = mapped_column(BigInteger, nullable=False, default=4_000_000)
     max_files: Mapped[int] = mapped_column(Integer, nullable=False, default=10)
     max_file_mb: Mapped[int] = mapped_column(Integer, nullable=False, default=15)
     max_storage_mb: Mapped[int] = mapped_column(Integer, nullable=False, default=100)
@@ -245,11 +254,60 @@ class UsageEvent(Base):
     )
 
 
+# --- shelves -----------------------------------------------------------------
+
+class Shelf(Base):
+    """A subject: one shelf of documents with its own knowledge graph.
+
+    A user who uploads a maths textbook and a programming manual wants two
+    knowledge bases, not one — otherwise entity resolution merges the "function"
+    of each into a single node and graph traversal walks from calculus into
+    closures. A shelf is that boundary, and it reuses the one the storage layer
+    already has: `slug` becomes the suffix of the Neo4j `corpus` tag and of the
+    DuckDB filename (see `container.corpus_for`).
+
+    Two columns carry the weight:
+
+    `slug` is storage-visible and therefore **immutable** once written. Renaming
+    a shelf changes `name` only; changing the slug would leave every chunk,
+    entity and community summary stranded under a corpus nothing queries. It is
+    unique per user, never globally — two people may both have a "physics".
+
+    `is_default` marks the one shelf whose slug is empty, whose corpus is
+    therefore the bare tenant id. That is where everything ingested before
+    shelves existed already lives, so the default shelf is not a new container
+    to migrate data into — it is the name for the data that is already there.
+    Exactly one per user, and it cannot be deleted.
+    """
+
+    __tablename__ = "shelves"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    name: Mapped[str] = mapped_column(String(80), nullable=False)
+    slug: Mapped[str] = mapped_column(String(32), nullable=False, default="")
+    # Which job preset this shelf opens with (see agent/presets.py). Stored as a
+    # plain string, not an enum column: presets are an application concern and a
+    # release that adds one should not need a migration. Unknown values clamp to
+    # `general` on read.
+    preset: Mapped[str] = mapped_column(String(24), nullable=False, default="general")
+    is_default: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    created_at: Mapped[datetime] = _now()
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "slug", name="uq_shelves_user_slug"),
+    )
+
+
 # --- chat --------------------------------------------------------------------
 
 class Thread(Base):
     """A conversation. The agent's own memory lives in the checkpointer keyed by
-    `{tenant_id}:{thread.id}`; this table is the transcript the UI renders and
+    `{corpus}:{thread.id}`; this table is the transcript the UI renders and
     the list it browses."""
 
     __tablename__ = "threads"
@@ -257,6 +315,14 @@ class Thread(Base):
     id: Mapped[uuid.UUID] = _uuid_pk()
     user_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    # Which shelf this conversation is asking about. Pinned at creation and not
+    # changed afterwards: the agent's memory for the thread is keyed on the
+    # shelf's corpus, so moving a thread would strand its history — and the
+    # transcript would cite passages the new shelf does not contain. NULL means
+    # the default shelf, which is what every thread predating shelves is.
+    shelf_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("shelves.id", ondelete="SET NULL")
     )
     title: Mapped[str] = mapped_column(String(120), nullable=False, default="New chat")
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -299,6 +365,14 @@ class File(Base):
     id: Mapped[str] = mapped_column(String(16), primary_key=True)
     user_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    # The shelf this document was ingested into. NULL is the default shelf, both
+    # for files that predate shelves and for a deleted shelf's leftovers —
+    # SET NULL rather than CASCADE because deleting a shelf must not silently
+    # delete the uploads, which still count against the user's file quota and
+    # still exist on disk.
+    shelf_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("shelves.id", ondelete="SET NULL")
     )
     name: Mapped[str] = mapped_column(Text, nullable=False)
     path: Mapped[str] = mapped_column(Text, nullable=False)
@@ -363,5 +437,5 @@ IS_ACTIVE = "active"
 __all__ = [
     "APIKey", "AppSetting", "AuditLog", "Base", "EmailOTP", "File", "GlobalLimit",
     "IngestJob", "LIMIT_COLUMNS", "Message", "PURPOSE_RESET", "PURPOSE_VERIFY",
-    "Session", "Thread", "UsageEvent", "User", "UserLimit",
+    "Session", "Shelf", "Thread", "UsageEvent", "User", "UserLimit",
 ]

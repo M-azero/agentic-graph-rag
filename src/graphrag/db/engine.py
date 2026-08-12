@@ -1,9 +1,11 @@
 """Async database engine and session helpers.
 
 One engine per process, created in the API lifespan and disposed on shutdown.
-The pool is deliberately small: on a 2 vCPU box a large pool buys nothing but
-Postgres backends competing for the same cores, and `max_connections` is a
-shared budget with the checkpointer's own pool.
+The pool is deliberately small, and stays small on a bigger box: a large pool
+buys nothing but Postgres backends competing for the same cores, and
+`max_connections` is a shared budget with the checkpointer's own pool. The API
+also runs a single uvicorn worker (the DuckDB vector provider takes an
+exclusive lock per tenant file), so one process holds this whole pool.
 """
 
 from __future__ import annotations
@@ -78,9 +80,22 @@ def build_sessionmaker(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
 
 @asynccontextmanager
 async def session_scope(
-    factory: async_sessionmaker[AsyncSession],
+    factory: async_sessionmaker[AsyncSession] | None,
 ) -> AsyncIterator[AsyncSession]:
-    """A transaction that commits on success and rolls back on error."""
+    """A transaction that commits on success and rolls back on error.
+
+    A `None` factory means the deployment has no database. That used to reach
+    `None()` and raise `TypeError: 'NoneType' object is not callable`, which
+    every caller surfaced as a 500 — a bare stack trace where the honest answer
+    is "this feature needs Postgres". Callers that can degrade should check
+    before calling; this is the backstop that makes the ones that cannot fail
+    legibly.
+    """
+    if factory is None:
+        raise ConfigError(
+            "No database is configured. Set GRAPHRAG_DATABASE_URL — accounts, "
+            "limits, usage and chat history all live in Postgres."
+        )
     async with factory() as session:
         try:
             yield session

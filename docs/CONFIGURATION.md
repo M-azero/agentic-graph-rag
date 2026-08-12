@@ -15,6 +15,12 @@ configs/default.yaml   <   configs/<profile>.yaml   <   environment (.env)
 Change the profile with `make setup PROFILE=local` (or `api`), or set
 `GRAPHRAG_PROFILE` directly.
 
+The agent's **job presets** are the one piece of behaviour that is not
+configured here: they are Markdown, one file per preset, in
+[`prompts/`](../prompts/README.md). Both directories are resolved the same way —
+found automatically in a source checkout, and pinned in the image by
+`GRAPHRAG_CONFIG_DIR` / `GRAPHRAG_PROMPT_DIR`.
+
 ## The one-change LLM toggle
 
 `GRAPHRAG_LLM="<provider>:<model>"` in `.env` flips the **reply LLM only**,
@@ -219,7 +225,7 @@ store/retriever wrappers are per-user, so memory stays flat as users grow.
 | `default_user`         | Namespace used when no user is given |
 | `per_tenant_database`  | `false`: isolate by a `corpus` tag inside one Neo4j DB (works on Community). `true`: a real Neo4j database per user (**requires Enterprise**) |
 | `database_prefix`      | Prefix for per-user database names (Enterprise mode) |
-| `max_active_tenants`   | Upper bound on the in-memory tenant cache; evicting a tenant drops only cheap wrappers, never the shared models |
+| `max_active_tenants`   | Upper bound on the in-memory tenant cache; evicting a tenant drops only cheap wrappers, never the shared models. **Counts shelves, not people** — a user with four shelves holds four entries |
 
 **Choosing a user per request:**
 
@@ -227,7 +233,41 @@ store/retriever wrappers are per-user, so memory stays flat as users grow.
 - **UI:** the user picker (top-right) selects/creates a user and stores it locally.
 - **CLI:** `graphrag ingest data/x.pdf --user alice`, `graphrag query "..." --user alice`.
 
-Conversation memory is namespaced per user, so threads never cross accounts.
+Conversation memory is namespaced per corpus, so threads never cross accounts —
+or shelves.
+
+## Shelves & job presets
+
+A **shelf** subdivides one account's knowledge base by subject. Its corpus is
+`{tenant}.{slug}`, or the bare tenant id for the default shelf, so each shelf has
+its own entities, community summaries and vector storage. Nothing here is
+configurable per deployment — shelves are created by users through `/shelves` —
+but two things are worth knowing:
+
+- The cap is `shelves.MAX_SHELVES` (24). Each shelf is a real resource: its own
+  graph constraints and, under the DuckDB provider, its own file and open handle.
+- A shelf's **slug is permanent**. Renaming changes the display name only;
+  changing the slug would strand everything stored under the old corpus.
+
+A **preset** is the job the assistant is doing with a shelf — one of `general`,
+`study`, `research`, `finance`, `legal`, `medical`, `code`, `business`,
+`writing`, `teaching`, `summary`. Each shelf stores the one it opens with; a
+request may override it per question.
+
+The prompts themselves are Markdown in [`prompts/`](../prompts/README.md), one
+file per preset, read once at startup and cached — **restart to pick up an
+edit**. `prompts/README.md` states the contract a preset has to satisfy; the
+short version is that a preset narrows what counts as a good answer and may
+never relax the grounding, citation or refusal rules above it in the prompt.
+
+| Key                    | What it does |
+|------------------------|--------------|
+| `GRAPHRAG_PROMPT_DIR`  | Where to read `prompts/*.md` from. Set in the image to `/app/prompts`; a source checkout finds the directory on its own. Point it at your own copy to override the shipped prompts without forking |
+
+| Key                    | What it does |
+|------------------------|--------------|
+| `agent.default_preset` | Preset for a shelf that names none, and for a request that sends none. Defaults to `general`, which defers to `agent.default_style` — that is what keeps pre-preset API clients rendering exactly the prompt they always did |
+| `agent.default_style`  | Phrasing used *only* under the `general` preset. A job preset replaces it, since both control the same axis |
 
 ## Secrets (`.env`)
 

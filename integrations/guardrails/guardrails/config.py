@@ -96,6 +96,13 @@ class Settings(BaseSettings):
     fail_mode: FailMode = "flag"
     policy_dir: str = "./policies"
     default_policy: str = "default"
+    # Whether a request body may set `mode: "fast"`, which skips the LLM judge
+    # and leaves only the deterministic rules. That is a useful escape hatch for
+    # a trusted caller doing bulk screening, and a bypass of the expensive half
+    # of the guard for anyone else — the client chooses how hard it is checked.
+    # Off by default: a policy's `judge.trigger` is the server-side way to say
+    # the same thing, and it cannot be overridden per request.
+    allow_client_mode: bool = False
 
     # ── Server ──────────────────────────────────────────────────────────────
     api_key: str | None = None

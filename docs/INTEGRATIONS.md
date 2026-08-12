@@ -210,10 +210,11 @@ send traces without a project key. For a hardened deployment, set
 `LLMLENS_API_KEY` on the RAG API.
 
 > **Footprint.** The full stack is ~12 containers. The base RAG stack targets a
-> 2 vCPU / 8 GB box; the llmlens platform adds ClickHouse (2 GB) + its own
-> Redis + api/worker (Postgres is shared with the RAG stack), so budget
-> **~14 GB** for `make deploy`, or run the light stack (`make up-features`)
-> and host llmlens elsewhere.
+> 4 vCPU / 12 GB box and takes 7.6 GB of that in caps; the llmlens platform
+> adds ClickHouse (2 GB) + its own Redis + api/worker (Postgres is shared with
+> the RAG stack) for another 4.6 GB. The two together overrun a 12 GB box, so
+> budget **16 GB** for `make deploy`, or run the light stack
+> (`make up-features`) and host llmlens elsewhere.
 
 ---
 

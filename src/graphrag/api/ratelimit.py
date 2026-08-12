@@ -22,6 +22,7 @@ proxy added.
 
 from __future__ import annotations
 
+import ipaddress
 import math
 import time
 
@@ -36,23 +37,49 @@ log = get_logger(__name__)
 RATE_LIMITED = "rate_limited"
 
 
+def _peer_may_speak_for_others(request: Request) -> bool:
+    """Whether the immediate peer is allowed to name the real caller.
+
+    Only the bundled proxy (a container on the compose network) or a local
+    process (loopback — an SSH tunnel, the box itself) can reach this API
+    without passing through Caddy's `header_up`. Both arrive from private or
+    loopback addresses. A *public* peer address means the API itself has been
+    exposed and there is no proxy in the path — at which point the forwarding
+    headers are whatever the caller typed, and honoring them would hand an
+    attacker a fresh rate-limit bucket per request and let them forge the
+    address recorded against every session.
+    """
+    client = request.client
+    if client is None or not client.host:
+        return False
+    try:
+        peer = ipaddress.ip_address(client.host)
+    except ValueError:
+        # Not an IP at all (some in-process test transports) — no proxy there.
+        return False
+    return peer.is_private or peer.is_loopback
+
+
 def client_ip(request: Request) -> str:
     """The caller's address, as far as it can be trusted.
 
-    `X-Real-IP` first: the bundled Caddy *sets* it (`header_up X-Real-IP
-    {remote_host}`), overwriting anything the client sent, so it cannot be
-    forged from outside. `X-Forwarded-For` is the fallback for a different
-    proxy in front, and we take its **last** hop for the reason in the module
-    docstring. With no proxy at all the socket address is already correct.
+    Forwarding headers are only consulted when the request came *through our
+    proxy* (see `_peer_may_speak_for_others`); a directly-reached API counts
+    the socket address, which no caller can choose. `X-Real-IP` first: the
+    bundled Caddy *sets* it (`header_up X-Real-IP {remote_host}`), overwriting
+    anything the client sent. `X-Forwarded-For` is the fallback for a
+    different proxy in front, and we take its **last** hop for the reason in
+    the module docstring.
     """
-    real = (request.headers.get("X-Real-IP") or "").strip()
-    if real:
-        return real
-    forwarded = request.headers.get("X-Forwarded-For")
-    if forwarded:
-        hops = [hop.strip() for hop in forwarded.split(",") if hop.strip()]
-        if hops:
-            return hops[-1]
+    if _peer_may_speak_for_others(request):
+        real = (request.headers.get("X-Real-IP") or "").strip()
+        if real:
+            return real
+        forwarded = request.headers.get("X-Forwarded-For")
+        if forwarded:
+            hops = [hop.strip() for hop in forwarded.split(",") if hop.strip()]
+            if hops:
+                return hops[-1]
     return get_remote_address(request)
 
 

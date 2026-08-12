@@ -108,6 +108,11 @@ class ChunkingCfg(BaseModel):
     max_tokens: int = 384
     overlap: int = 64
     semantic: SemanticChunkCfg = Field(default_factory=SemanticChunkCfg)
+    # Choose the strategy per document instead of using `strategy` for
+    # everything: token windows for tabular files, recursive where there are
+    # real headings, semantic for OCR'd prose. Deterministic — no model call —
+    # and `strategy` remains the fallback whenever no signal fires.
+    route_per_document: bool = False
 
 
 class VisionLLMCfg(BaseModel):
@@ -200,11 +205,44 @@ class RetrievalCfg(BaseModel):
     min_relevance: float = 0.0
 
 
+class ReviewCfg(BaseModel):
+    """Check an answer before returning it.
+
+    The deterministic half — parsing the answer's [source: ...] tags and
+    comparing them with what retrieval actually returned — costs no tokens and
+    runs whatever this says. `enabled` controls only the model-backed half: a
+    critic that judges completeness and support, and a reviser that repairs what
+    it finds.
+    """
+
+    enabled: bool = False
+    # Extra research passes allowed when the critic says evidence is missing.
+    # 0 means check and repair but never re-retrieve, which is the cheap
+    # configuration; each extra round costs roughly another full answer.
+    max_rounds: int = 1
+    # How far to walk the :NEXT chain when recovering context a chunk boundary
+    # cut in half. Tried before any fresh retrieval, because it is one graph hop
+    # against an embedding call plus a rerank.
+    window_before: int = 1
+    window_after: int = 1
+    # Below both of these, a cleanly-cited draft skips the critic entirely.
+    # This gate is what keeps review close to cost-neutral, so raising them
+    # trades accuracy for tokens rather than the other way round.
+    critic_free_tool_calls: int = 1
+    critic_free_chars: int = 1200
+
+
 class AgentCfg(BaseModel):
     memory: bool = True
     memory_backend: str = "redis"  # redis | postgres (durable) — memory falls back in-process
     max_tool_iterations: int = 6
     default_style: str = "detailed"
+    # The job preset a shelf gets when its owner doesn't choose one, and what a
+    # request naming no preset resolves to. `general` defers to `default_style`,
+    # which is what keeps every pre-preset caller rendering the prompt it always
+    # did. See `agent/presets.py` for the ten alternatives.
+    default_preset: str = "general"
+    review: ReviewCfg = ReviewCfg()
 
 
 class CommunityCfg(BaseModel):

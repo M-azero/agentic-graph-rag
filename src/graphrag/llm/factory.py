@@ -42,6 +42,19 @@ _CREDENTIAL = {
 }
 
 
+def chat_providers() -> set[str]:
+    """Every provider `build_chat_model` knows how to construct.
+
+    Exported so the config loader can validate `GRAPHRAG_LLM` against what the
+    factory actually supports instead of keeping its own copy of the list —
+    which drifted, and rejected the two providers the production profile runs on.
+
+    Ollama is added explicitly: it is the one provider with no credential, so it
+    has no entry in `_CREDENTIAL`.
+    """
+    return set(_CREDENTIAL) | {"ollama"}
+
+
 def has_credentials(provider: str, secrets: Secrets) -> bool:
     """Is this provider configured well enough to be worth calling?
 

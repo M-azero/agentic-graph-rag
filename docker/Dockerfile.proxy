@@ -38,8 +38,9 @@ COPY --from=chat    /app/dist /srv/app
 COPY --from=console /app/dist /srv/admin
 
 # Bodies larger than this are refused here, before they reach the API. Keep it
-# >= api.max_upload_mb in configs/*.yaml, or an upload dies as a bare 413
+# strictly ABOVE api.max_upload_mb in configs/*.yaml (this bounds the multipart
+# body, that bounds the file inside it), or an upload dies as a bare 413
 # without the API's own explanation. Overridden from .env via compose.
-ENV MAX_UPLOAD_MB=25
+ENV MAX_UPLOAD_MB=26
 
 EXPOSE 80 443

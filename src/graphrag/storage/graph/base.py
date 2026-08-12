@@ -24,6 +24,29 @@ class GraphStore(abc.ABC):
         vector store is external but fulltext + MENTIONS still live here."""
 
     @abc.abstractmethod
+    def link_chunk_sequence(self, chunks: list[Chunk]) -> None:
+        """Record document order: `index` on each node, and a :NEXT edge from
+        each chunk to the one that follows it.
+
+        Called from the ingest pipeline rather than from `upsert_chunks`,
+        because the chunk nodes have two possible authors — the Neo4j vector
+        store writes them when vectors live here, the graph store writes them
+        when they don't. Linking separately is the only way the chain exists
+        under every vector provider.
+        """
+
+    @abc.abstractmethod
+    def chunk_window(
+        self, chunk_ids: list[str], before: int = 1, after: int = 1
+    ) -> list[RetrievedChunk]:
+        """The chunks immediately surrounding the given ones, in reading order.
+
+        Walks the :NEXT chain laid down by `link_chunk_sequence`. This is the
+        cheap way to recover context a chunk boundary cut in half — one graph
+        traversal, no embedding call and no rerank.
+        """
+
+    @abc.abstractmethod
     def link_chunk_entities(self, chunk_id: str, entity_keys: list[str]) -> None: ...
 
     @abc.abstractmethod
