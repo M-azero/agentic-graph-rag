@@ -147,6 +147,88 @@ class Neo4jGraphStore(GraphStore):
             rows=rows,
         )
 
+    def link_chunk_sequence(self, chunks: list[Chunk]) -> None:
+        """Stamp the document position and chain the chunks with :NEXT."""
+        if not chunks:
+            return
+        ordered = sorted(chunks, key=lambda c: c.index)
+        self._run(
+            """
+            UNWIND $rows AS row
+            MATCH (c:Chunk {corpus: $corpus, id: row.id})
+            SET c.index = row.index
+            """,
+            rows=[{"id": c.id, "index": c.index} for c in ordered],
+        )
+        pairs = [
+            {"prev": a.id, "next": b.id}
+            for a, b in zip(ordered, ordered[1:], strict=False)
+        ]
+        if not pairs:
+            return
+        self._run(
+            # MERGE, not CREATE: re-ingesting a document that produced the same
+            # chunk boundaries would otherwise stack duplicate edges and make
+            # the window query return each neighbour several times.
+            """
+            UNWIND $pairs AS pair
+            MATCH (a:Chunk {corpus: $corpus, id: pair.prev})
+            MATCH (b:Chunk {corpus: $corpus, id: pair.next})
+            MERGE (a)-[:NEXT]->(b)
+            """,
+            pairs=pairs,
+        )
+
+    # Bound on how far `chunk_window` will walk. Variable-length patterns must
+    # carry a literal upper bound in Cypher, so this is interpolated — hence
+    # `int()` and the clamp, never a raw caller value.
+    _MAX_WINDOW = 5
+
+    def chunk_window(
+        self, chunk_ids: list[str], before: int = 1, after: int = 1
+    ) -> list[RetrievedChunk]:
+        ids = [i for i in dict.fromkeys(chunk_ids) if i]
+        before = max(0, min(int(before), self._MAX_WINDOW))
+        after = max(0, min(int(after), self._MAX_WINDOW))
+        if not ids or (before == 0 and after == 0):
+            return []
+
+        # One query per direction, unioned here. A single query with two
+        # OPTIONAL MATCHes would multiply the predecessors by the successors
+        # before deduplicating, and the subquery forms that avoid that are
+        # newer than the Neo4j this deploys against.
+        found: dict[str, RetrievedChunk] = {}
+        order: dict[str, tuple[str, int]] = {}
+        directions = []
+        if before:
+            directions.append(f"(n:Chunk {{corpus: $corpus}})-[:NEXT*1..{before}]->(c)")
+        if after:
+            directions.append(f"(c)-[:NEXT*1..{after}]->(n:Chunk {{corpus: $corpus}})")
+
+        for pattern in directions:
+            for r in self._run(
+                f"""
+                MATCH (c:Chunk {{corpus: $corpus}}) WHERE c.id IN $ids
+                MATCH {pattern}
+                WHERE NOT n.id IN $ids
+                RETURN DISTINCT n.id AS id, n.text AS text, n.source AS source,
+                       n.metadata AS metadata, n.doc_id AS doc_id,
+                       coalesce(n.index, 0) AS index
+                """,
+                ids=ids,
+            ):
+                found[r["id"]] = RetrievedChunk(
+                    chunk_id=r["id"], text=r["text"], source=r["source"],
+                    # Neighbours were reached structurally, not scored by
+                    # retrieval. Inventing a relevance score would let them
+                    # outrank genuinely retrieved chunks in fusion.
+                    score=0.0, retriever="window", metadata=_meta(r["metadata"]),
+                )
+                order[r["id"]] = (r["doc_id"] or "", int(r["index"] or 0))
+
+        # Reading order, so the caller can splice a window back together.
+        return [found[k] for k in sorted(found, key=lambda k: order[k])]
+
     def link_chunk_entities(self, chunk_id: str, entity_keys: list[str]) -> None:
         if not entity_keys:
             return

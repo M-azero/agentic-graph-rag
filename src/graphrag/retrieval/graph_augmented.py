@@ -7,7 +7,10 @@ from __future__ import annotations
 
 from graphrag.core.types import RetrievedChunk
 from graphrag.retrieval.base import Retriever
+from graphrag.retrieval.plan import active_plan
 from graphrag.storage.graph.base import GraphStore
+
+_DEFAULT_SEEDS = 5
 
 
 class GraphAugmentedRetriever(Retriever):
@@ -16,7 +19,13 @@ class GraphAugmentedRetriever(Retriever):
         self._hops = hops
 
     def retrieve(self, query: str, k: int) -> list[RetrievedChunk]:
-        seeds = self._graph.fulltext_entities(query, k=5)
+        # A bound plan wins entirely; without one nothing changes and the
+        # configured depth stands.
+        plan = active_plan()
+        hops = plan.graph_hops if plan else self._hops
+        seeds = self._graph.fulltext_entities(
+            query, k=plan.entity_seeds if plan else _DEFAULT_SEEDS
+        )
         if not seeds:
             return []
-        return self._graph.expand_chunks(seeds, hops=self._hops, limit=k)
+        return self._graph.expand_chunks(seeds, hops=hops, limit=k)

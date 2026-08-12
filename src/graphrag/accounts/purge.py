@@ -21,7 +21,7 @@ from sqlalchemy import delete, select
 
 from graphrag.core.logging import get_logger
 from graphrag.db.engine import session_scope
-from graphrag.db.models import File, User
+from graphrag.db.models import File, Shelf, User
 
 log = get_logger(__name__)
 
@@ -68,6 +68,16 @@ async def purge_user(db, container, user_id: str, *, keep_account: bool = False)
                 await s.execute(select(File).where(File.user_id == owner))
             ).scalars().all()
         ]
+        # Every shelf, plus the default one. The default's slug is "" and it may
+        # have no row at all (an account that predates migration 0004), so it is
+        # added unconditionally rather than read — and a set keeps the two from
+        # purging the same corpus twice.
+        slugs = set(
+            (
+                await s.execute(select(Shelf.slug).where(Shelf.user_id == owner))
+            ).scalars().all()
+        )
+        slugs.add("")
     report.tenant_id = tenant_id
 
     # Uploaded files on disk.
@@ -78,30 +88,44 @@ async def purge_user(db, container, user_id: str, *, keep_account: bool = False)
         except OSError as exc:
             report.errors.append(f"file {path}: {exc}")
 
-    # The tenant's graph and vectors. Built from the store factories directly
-    # rather than via `container.tenant()`: that would construct the embedder,
-    # reranker and agent too, so deleting a user's data would fail whenever an
-    # embedding provider happened to be unreachable.
-    try:
-        from graphrag.storage import build_graph_store
+    # The graph and vectors of every shelf. Built from the store factories
+    # directly rather than via `container.tenant()`: that would construct the
+    # embedder, reranker and agent too, so deleting a user's data would fail
+    # whenever an embedding provider happened to be unreachable.
+    #
+    # Each shelf is its own corpus and its own DuckDB file, so each needs its
+    # own purge — and each is independently best-effort. One shelf failing must
+    # not strand the rest, which is the same reason the four stores below are
+    # separate steps rather than one transaction.
+    for slug in sorted(slugs):
+        try:
+            from graphrag.storage import build_graph_store
 
-        database, corpus = container._resolve_scope(tenant_id)
-        graph_store = build_graph_store(
-            container.driver, database, corpus, container.settings
-        )
-        report.graph_nodes = graph_store.purge_corpus()
-    except Exception as exc:
-        log.warning("purge_graph_failed", tenant=tenant_id, error=str(exc))
-        report.errors.append(f"graph: {exc}")
+            database, corpus = container._resolve_scope(tenant_id, slug)
+            graph_store = build_graph_store(
+                container.driver, database, corpus, container.settings
+            )
+            report.graph_nodes += graph_store.purge_corpus()
+        except Exception as exc:
+            log.warning(
+                "purge_graph_failed", tenant=tenant_id, shelf=slug, error=str(exc)
+            )
+            report.errors.append(f"graph[{slug or 'default'}]: {exc}")
 
-    try:
-        report.vectors_removed = _drop_vector_store(container, tenant_id)
-    except Exception as exc:
-        log.warning("purge_vectors_failed", tenant=tenant_id, error=str(exc))
-        report.errors.append(f"vectors: {exc}")
+        try:
+            # `or` rather than `and`: any shelf whose file was removed counts,
+            # and a shelf that never had one must not clear the flag.
+            report.vectors_removed = (
+                _drop_vector_store(container, tenant_id, slug) or report.vectors_removed
+            )
+        except Exception as exc:
+            log.warning(
+                "purge_vectors_failed", tenant=tenant_id, shelf=slug, error=str(exc)
+            )
+            report.errors.append(f"vectors[{slug or 'default'}]: {exc}")
 
-    # Evict the cached tenant so a later request rebuilds it from nothing.
-    container._tenants.pop(tenant_id, None)
+    # Evict every cached shelf so a later request rebuilds from nothing.
+    container.evict_tenant(tenant_id)
 
     async with session_scope(db) as s:
         if keep_account:
@@ -118,8 +142,8 @@ async def purge_user(db, container, user_id: str, *, keep_account: bool = False)
     return report
 
 
-def _drop_vector_store(container, tenant_id: str) -> bool:
-    """Delete the tenant's vector data. For DuckDB that is a file, and the
+def _drop_vector_store(container, tenant_id: str, shelf: str = "") -> bool:
+    """Delete one shelf's vector data. For DuckDB that is a file, and the
     handle has to be closed first or Windows refuses to unlink it."""
     cfg = container.settings.storage.vector
     if cfg.provider == "neo4j":
@@ -130,8 +154,14 @@ def _drop_vector_store(container, tenant_id: str) -> bool:
 
     from graphrag.storage.vector.duckdb_store import close_file
 
-    database = container.settings.storage.graph.database
-    path = Path(cfg.duckdb_dir) / database / f"{tenant_id}.duckdb"
+    # `_resolve_scope`, not `storage.graph.database`: under
+    # `tenancy.per_tenant_database` the store was built beneath `u_<tenant>/`,
+    # so the flat name pointed at a path that never existed — the purge reported
+    # `vectors_removed: False` with no error and the deleted user's vectors
+    # stayed on disk. The corpus it returns is also what names the file, which
+    # is what makes this correct per shelf rather than only for the default one.
+    database, corpus = container._resolve_scope(tenant_id, shelf)
+    path = Path(cfg.duckdb_dir) / database / f"{corpus}.duckdb"
     close_file(path)
     existed = path.exists()
     path.unlink(missing_ok=True)

@@ -42,21 +42,38 @@ class PgKeyStore:
         self._factory = factory
         self._redis = redis_client
 
-    async def create_key(self, user_id: str, label: str = "") -> str:
-        """Mint a key for a user and return it. This is the only time the
-        plaintext exists — only its hash is stored."""
+    async def create_key(self, user_id: str, label: str = "") -> tuple[int, str]:
+        """Mint a key for a user; return `(id, plaintext)`.
+
+        The id comes from the inserted row rather than from re-listing the
+        user's keys afterwards and taking the newest. That read-back raced: two
+        keys created in the same second sort ambiguously by `created_at`, so the
+        caller could be handed one key's plaintext alongside another key's id —
+        and then revoke the wrong one.
+        """
         key = generate_api_key()
         async with session_scope(self._factory) as s:
-            s.add(APIKey(user_id=user_id, key_hash=hash_key(key), label=label[:64]))
-        return key
+            row = APIKey(user_id=user_id, key_hash=hash_key(key), label=label[:64])
+            s.add(row)
+            await s.flush()  # assign the primary key inside the transaction
+            key_id = row.id
+        return key_id, key
+
+    @property
+    def available(self) -> bool:
+        return self._factory is not None
 
     async def resolve(self, key: str) -> KeyOwner | None:
         """Return the owner of a live key, or None.
 
         A revoked key, or one whose owner is not active, resolves to None —
         suspending an account must cut off its API keys too, not just its
-        browser sessions.
+        browser sessions. So does any key at all when there is no database to
+        check it against: this runs on every programmatic request, and raising
+        there turns "accounts are not configured" into a 500 on every call.
         """
+        if not key or self._factory is None:
+            return None
         h = hash_key(key)
         cached = self._cache_get(h)
         if cached is not None:

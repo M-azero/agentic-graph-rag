@@ -17,6 +17,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
 from graphrag.accounts import AccountError, AccountService, hash_session_token
+from graphrag.agent.presets import preset_options
 from graphrag.api.deps import (
     SESSION_COOKIE,
     AuthUser,
@@ -40,6 +41,7 @@ from graphrag.api.schemas import (
     LoginRequest,
     Me,
     ModelOption,
+    PresetOption,
     ResetPasswordRequest,
     SessionInfo,
     SessionList,
@@ -86,7 +88,7 @@ def _set_session_cookie(
 
 
 def _require_accounts(accounts: AccountService | None) -> AccountService:
-    if accounts is None or accounts._factory is None:
+    if accounts is None or not accounts.available:
         raise HTTPException(
             status_code=503,
             detail="Accounts are unavailable: the server has no database configured.",
@@ -165,7 +167,7 @@ async def verify(
             status_code=400, detail={"code": exc.code, "message": str(exc)}
         ) from None
     _set_session_cookie(response, token, container, request)
-    return _me(principal, container)
+    return _me(principal, container, _enabled_models(request))
 
 
 @router.post(
@@ -199,7 +201,7 @@ async def login(
             status = 401
         raise _account_error(exc, status) from None
     _set_session_cookie(response, token, container, request)
-    return _me(principal, container)
+    return _me(principal, container, _enabled_models(request))
 
 
 # -- passwords ----------------------------------------------------------------
@@ -344,17 +346,20 @@ async def logout(
 
 @router.get("/me", response_model=Me)
 async def me(
+    request: Request,
     user: AuthUser = Depends(get_current_user),
     container: Container = Depends(get_container),
 ) -> Me:
     """Who am I, and what can I choose? The UI calls this on load."""
+    enabled = _enabled_models(request)
     return Me(
         user_id=user.user_id,
         email=user.email,
         role=user.role,
         tenant_id=user.tenant_id,
-        models=_model_options(container),
-        default_model=resolve_model(None, container.settings).model,
+        models=_model_options(container, enabled),
+        default_model=resolve_model(None, container.settings, enabled).model,
+        presets=_preset_options(),
     )
 
 
@@ -433,9 +438,8 @@ async def create_key(
 ) -> APIKeyCreated:
     """Mint a key. The plaintext is returned exactly once — only its hash is
     stored, so a lost key is replaced, never recovered."""
-    key = await key_store.create_key(user.user_id, payload.label)
-    rows = await key_store.list_keys(user.user_id)
-    return APIKeyCreated(id=rows[0].id if rows else 0, api_key=key)
+    key_id, key = await key_store.create_key(user.user_id, payload.label)
+    return APIKeyCreated(id=key_id, api_key=key)
 
 
 @router.delete("/keys/{key_id}", response_model=Acknowledged)
@@ -451,19 +455,39 @@ async def revoke_key(
 
 # -- helpers ------------------------------------------------------------------
 
-def _model_options(container: Container) -> list[ModelOption]:
+def _enabled_models(request: Request) -> list[str] | None:
+    """The admin's narrowing of the model list, or None when they set none."""
+    return getattr(request.app.state, "enabled_models", None)
+
+
+def _model_options(
+    container: Container, enabled: list[str] | None = None
+) -> list[ModelOption]:
     return [
         ModelOption(model=m.model, label=m.label or m.model, provider=m.provider)
-        for m in allowed_models(container.settings)
+        for m in allowed_models(container.settings, enabled)
     ]
 
 
-def _me(principal, container: Container) -> Me:
+def _preset_options() -> list[PresetOption]:
+    """The job presets the composer offers. Shipped on `/auth/me` alongside the
+    models so the UI has everything it needs to render the picker from one
+    call, and never carries its own copy of the list."""
+    return [
+        PresetOption(
+            id=str(p.id), label=p.label, emoji=p.emoji, description=p.description
+        )
+        for p in preset_options()
+    ]
+
+
+def _me(principal, container: Container, enabled: list[str] | None = None) -> Me:
     return Me(
         user_id=principal.user_id,
         email=principal.email,
         role=principal.role,
         tenant_id=principal.tenant_id,
-        models=_model_options(container),
-        default_model=resolve_model(None, container.settings).model,
+        models=_model_options(container, enabled),
+        default_model=resolve_model(None, container.settings, enabled).model,
+        presets=_preset_options(),
     )

@@ -17,6 +17,29 @@ class AnswerStyle(enum.StrEnum):
     ELI5 = "eli5"
 
 
+class AnswerPreset(enum.StrEnum):
+    """What *job* the assistant is doing with the documents.
+
+    Where `AnswerStyle` sets register and length, a preset sets the whole
+    working method: what a finance question needs surfaced is not what a legal
+    one needs. GENERAL is the neutral default and is what an unset — or
+    unrecognised — request resolves to, so every existing client keeps the
+    behaviour it has today; see `agent.presets`.
+    """
+
+    GENERAL = "general"
+    STUDY = "study"
+    RESEARCH = "research"
+    FINANCE = "finance"
+    LEGAL = "legal"
+    MEDICAL = "medical"
+    CODE = "code"
+    BUSINESS = "business"
+    WRITING = "writing"
+    TEACHING = "teaching"
+    SUMMARY = "summary"
+
+
 def _stable_id(*parts: str) -> str:
     return hashlib.sha1("::".join(parts).encode("utf-8")).hexdigest()[:16]
 
@@ -93,6 +116,11 @@ class QueryResult:
     answer: str
     sources: list[RetrievedChunk] = field(default_factory=list)
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    # Non-chunk provenances the run surfaced ("knowledge-graph",
+    # "community-summaries"). They are citable but belong to no single chunk,
+    # so citation checking needs them alongside `sources` to tell a graph-backed
+    # citation apart from an invented one.
+    source_labels: list[str] = field(default_factory=list)
     # What this one question cost, prompt side included. Zero when nothing
     # metered the run (the CLI, or a caller that passed no meter) — never a
     # claim that the run was free.

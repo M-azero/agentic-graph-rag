@@ -1,15 +1,8 @@
 import { ArrowUp, Square } from "lucide-react";
 import { useEffect, useRef, type KeyboardEvent } from "react";
 
-import type { ModelOption } from "../../api";
+import type { ModelOption, PresetOption } from "../../api";
 import { Button, Select } from "../ui";
-
-const STYLES = [
-  { value: "detailed", label: "Detailed" },
-  { value: "concise", label: "Concise" },
-  { value: "technical", label: "Technical" },
-  { value: "eli5", label: "Simple" },
-];
 
 const MAX_HEIGHT = 200;
 
@@ -19,8 +12,9 @@ export function Composer({
   onSend,
   onStop,
   busy,
-  style,
-  onStyleChange,
+  preset,
+  onPresetChange,
+  presets,
   model,
   onModelChange,
   models,
@@ -31,8 +25,11 @@ export function Composer({
   onSend: () => void;
   onStop: () => void;
   busy: boolean;
-  style: string;
-  onStyleChange: (v: string) => void;
+  // The job the assistant is doing — study, finance, legal… The list comes
+  // from the server (`/auth/me`), so this component never hardcodes it.
+  preset: string;
+  onPresetChange: (v: string) => void;
+  presets: PresetOption[];
   model: string;
   onModelChange: (v: string) => void;
   models: ModelOption[];
@@ -76,14 +73,15 @@ export function Composer({
 
         <div className="flex items-center gap-2 px-2.5 pb-2.5">
           <Select
-            value={style}
-            onChange={(e) => onStyleChange(e.target.value)}
-            aria-label="Answer style"
+            value={preset}
+            onChange={(e) => onPresetChange(e.target.value)}
+            aria-label="Mode"
+            title={presets.find((p) => p.id === preset)?.description}
             className="h-7 !w-auto py-0 text-xs"
           >
-            {STYLES.map((s) => (
-              <option key={s.value} value={s.value}>
-                {s.label}
+            {presets.map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.emoji} {p.label}
               </option>
             ))}
           </Select>

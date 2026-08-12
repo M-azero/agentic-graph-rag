@@ -95,6 +95,41 @@ web: ## Build both web apps (type-checks them too)
 
 frontend: web   ## Deprecated alias for `web`
 
+# Host security: SSH, firewall, fail2ban, port exposure. AUDIT ONLY — it
+# reports and changes nothing. Applying is deliberately not a make target: it
+# needs SSH_USER and takes the box's remote access with it, so it wants the
+# arguments typed out.
+#
+# The script is operator material for a specific box and is not committed (see
+# .gitignore), so this target explains itself rather than failing with a bare
+# "No such file" on a fresh clone. `make ports` is the part everyone needs and
+# it works everywhere.
+harden: ## Audit the host's SSH / firewall / port exposure (changes nothing)
+	@if [ -x ./scripts/harden-host.sh ]; then \
+	    sudo ./scripts/harden-host.sh; \
+	else \
+	    echo "scripts/harden-host.sh is not in this checkout — it is operator"; \
+	    echo "material for one deployment, not part of the project."; \
+	    echo; \
+	    echo "For host hardening guidance see docs/DEPLOYMENT.md."; \
+	    echo "For the check that matters most here, run:  make ports"; \
+	fi
+
+# The compose files bind everything but the proxy to 127.0.0.1. This is the
+# check that it stayed that way: a dropped prefix is a database on the public
+# internet, and `ufw deny` does not close a published container port.
+ports: ## Fail if a container port is published outside 127.0.0.1 (except 80/443)
+	@exposed=`$(COMPOSE) ps --format '{{.Name}}|{{.Ports}}' 2>/dev/null \
+	    | awk -F'|' '{n=split($$2,m,", "); for(i=1;i<=n;i++) if(m[i]!="") print $$1 "  " m[i]}' \
+	    | grep -E '(0\.0\.0\.0|\[::\]):' | grep -vE ':(80|443)->'`; \
+	if [ -n "$$exposed" ]; then \
+	  echo "EXPOSED - these answer from the network and should be 127.0.0.1-bound:"; \
+	  echo "$$exposed"; \
+	  echo "Fix the ports: entry in docker-compose.yml, then: docker compose up -d"; \
+	  exit 1; \
+	fi; \
+	echo "OK - only the proxy's 80/443 are reachable from the network"
+
 # The Caddyfile is the only way into the deployment. Check it before you ship
 # it, not after the container refuses to start.
 proxy-check: ## Validate docker/Caddyfile without deploying it
@@ -108,6 +143,6 @@ fmt: ## Auto-format & fix
 	ruff check --fix src tests migrations
 	ruff format src tests migrations
 
-.PHONY: help install setup migrate serve worker ingest admin up down logs \
-        up-features deploy deploy-down \
+.PHONY: help install setup migrate serve worker ingest admin unlock up down logs \
+        up-features deploy deploy-down harden ports proxy-check web \
         test test-integration test-all eval frontend lint fmt

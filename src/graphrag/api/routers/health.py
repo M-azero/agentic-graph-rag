@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from fastapi import APIRouter, Depends, Request
 from sqlalchemy import text
 
@@ -33,7 +35,10 @@ async def ready(
     logins and queries 503 while the probe insists all is well. With auth off
     it is optional and its state is reported without gating.
     """
-    neo4j_ok = _check_neo4j(container)
+    # Off the loop: the Neo4j probe is a blocking round trip on an endpoint an
+    # orchestrator polls every few seconds, and this process serves every other
+    # request on the same thread.
+    neo4j_ok = await asyncio.to_thread(_check_neo4j, container)
     redis_ok = container.redis is not None
     db_ok = await _check_db(request)
     db_required = container.settings.auth.enabled

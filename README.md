@@ -164,7 +164,7 @@ base"* — never a plausible invention.
 
 Brings up Neo4j, **Postgres**, Redis, the API, the web UI, and a **TLS reverse
 proxy** together. Per-container RAM/CPU caps are set in `.env` (`*_MEM_LIMIT` /
-`*_CPU_LIMIT`); the defaults target a 2 vCPU / 8 GB VPS.
+`*_CPU_LIMIT`); the defaults target a 4 vCPU / 12 GB VPS.
 
 ```bash
 git clone <your-repo-url> agentic-graph-rag && cd agentic-graph-rag
@@ -274,6 +274,14 @@ account gets a fully isolated knowledge base — its own Neo4j corpus and its ow
 DuckDB vector file — while the heavy models are loaded once and shared across
 everyone, so adding users costs almost no extra memory.
 
+Within an account, **shelves** split that knowledge base by subject. A maths
+textbook and a programming manual get their own corpus each, so their entities
+and community summaries never merge — upload to a shelf, and a question searches
+that shelf alone. Each shelf also remembers which of the ten **job presets**
+(Study, Finance, Legal, Research, Medical, Code, Business, Writing, Teaching,
+Summarize) it opens with. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) →
+Shelves.
+
 Development profiles have auth off and fall back to the `X-User-Id` header. See
 [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) → Multi-user.
 
@@ -290,18 +298,20 @@ curl -H "Authorization: Bearer grk_…" -X POST localhost:8000/query \
 | `GET`  | `/auth/me` · `/auth/limits` | Who am I; my allowances and what I've used. |
 | `GET`/`POST`/`DELETE` | `/auth/keys` | Personal API keys (shown once). |
 | `GET`/`POST`/`PATCH`/`DELETE` | `/threads` · `/threads/{id}` · `/threads/{id}/messages` | Conversations and their transcripts. |
+| `GET`/`POST`/`PATCH`/`DELETE` | `/shelves` · `/shelves/{id}` | Subjects: a separate knowledge base per shelf. Deleting one takes its documents and graph with it. |
+| `GET`  | `/shelves/presets` | The ten job presets the composer offers. |
 | `GET`  | `/admin/users` · `/admin/users/{id}` | List, search and inspect accounts. |
 | `PATCH`/`DELETE` | `/admin/users/{id}` | Suspend, change role, or purge everything they own. |
 | `GET`/`PUT` | `/admin/limits` · `/admin/users/{id}/limits` · `/admin/limits/bulk` | Limits: global defaults, per user, or applied to everyone. |
 | `GET`  | `/admin/usage` · `/admin/system` · `/admin/audit` | Usage over time, service status, admin action log. |
 | `GET`  | `/admin/users/{id}/graph` · `/graph/sample` | A tenant's knowledge-graph stats and a slice to visualize. |
-| `POST` | `/query` | Ask a question. Streams the answer (SSE) by default; returns sources used. |
+| `POST` | `/query` | Ask a question. Streams the answer (SSE) by default; returns sources used. Takes `preset` (the job) and, on a new thread, `shelf_id`. |
 | `POST` | `/compare` | Side-by-side comparison of several subjects. |
 | `POST` | `/search` | Raw hybrid retrieval, no LLM — see exactly what the retriever returns. |
 | `POST` | `/ingest` | Ingest a server-side path (under `data/`) **or an http(s) URL** (background job). |
 | `POST` | `/ingest/upload` | Upload and ingest a file. |
 | `GET`  | `/ingest/{job_id}` | Check ingest progress. |
-| `GET`  | `/ingest/files` | List your uploaded files and slots used. |
+| `GET`  | `/ingest/files` | List your uploaded files and slots used. `?shelf_id=` narrows to one shelf. |
 | `DELETE` | `/ingest/files/{file_id}` | Delete a file, its chunks and orphaned entities, and free its slot. |
 | `GET`  | `/usage` | Per-user token usage (admin-gated). |
 | `GET`  | `/health` · `/ready` · `/metrics` | Liveness / readiness / Prometheus metrics. |
@@ -638,8 +648,14 @@ This is built to run as a controllable service, not just a demo. What's in place
   not 403 — ids can't be probed.
 - **Resource controls.** Every container has RAM/CPU caps (`.env`:
   `API_MEM_LIMIT`, `NEO4J_MEM_LIMIT`, `NEO4J_HEAP`, `POSTGRES_MEM_LIMIT`, …),
-  defaulting to a set that fits 2 vCPU / 8 GB with headroom, plus CPU-thread caps
-  (`OMP_NUM_THREADS`) so local models can't starve the host.
+  defaulting to a set that fits 4 vCPU / 12 GB with headroom, plus CPU-thread
+  caps (`OMP_NUM_THREADS`) so local models can't starve the host.
+- **Ports that stay shut.** Every container but the proxy binds to `127.0.0.1`,
+  so from the network only the proxy exists; `make ports` fails the build if a
+  prefix ever goes missing. That binding is the real control — `ufw deny` does
+  **not** close a published container port, because Docker's iptables rules are
+  evaluated before ufw's. [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) covers
+  hardening the host underneath.
 - **Confined server-side ingest.** `POST /ingest` with a path is fenced to
   `data/` (an attempt to reach `.env` or any other server file is a 400), and it
   also accepts an http(s) URL, fetched with a size cap. Uploads go through
@@ -702,6 +718,11 @@ scan DuckDB uses is honest and fast at the per-user chunk ceiling, but it is a
 scan.
 
 ## Development
+
+New here? [`CONTRIBUTING.md`](CONTRIBUTING.md) covers what this repo
+deliberately does not carry (credentials, one deployment's operational detail)
+and how to supply your own, plus the easiest places to start — adding an answer
+preset needs a single Markdown file and no Python.
 
 ```bash
 make install     # editable install with dev + extra providers

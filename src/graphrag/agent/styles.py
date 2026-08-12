@@ -22,9 +22,18 @@ _STYLE_INSTRUCTIONS: dict[AnswerStyle, str] = {
 }
 
 
-def style_instruction(style: str | AnswerStyle) -> str:
+def canonical_style(style: str | AnswerStyle) -> AnswerStyle:
+    """Clamp anything — including a raw request string — to a known style.
+
+    Callers that key a cache on the style must use this rather than the raw
+    value: "detailed", "banana" and "" all render the same prompt, so keying on
+    the raw string would let request input mint unbounded distinct keys.
+    """
     try:
-        style = AnswerStyle(style)
+        return AnswerStyle(style)
     except ValueError:
-        style = AnswerStyle.DETAILED
-    return _STYLE_INSTRUCTIONS[style]
+        return AnswerStyle.DETAILED
+
+
+def style_instruction(style: str | AnswerStyle) -> str:
+    return _STYLE_INSTRUCTIONS[canonical_style(style)]

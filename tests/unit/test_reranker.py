@@ -14,12 +14,20 @@ from graphrag.retrieval import reranker as rr
 
 class _FakeLLM:
     """Replies are keyed by document text, not call order — `rerank` scores
-    candidates concurrently, so order isn't deterministic."""
+    candidates concurrently, so order isn't deterministic.
+
+    `config` is accepted because the real `Runnable.invoke` takes it and the
+    reranker passes the request's token meter through it. A double narrower than
+    the interface it stands in for turns a metering change into three unrelated
+    ordering failures, so the configs are recorded rather than ignored.
+    """
 
     def __init__(self, by_doc: dict[str, str]) -> None:
         self.by_doc = by_doc
+        self.configs: list[dict] = []
 
-    def invoke(self, prompt: str):
+    def invoke(self, prompt: str, config: dict | None = None, **kwargs):
+        self.configs.append(config or {})
         for doc, reply in self.by_doc.items():
             if doc in prompt:
                 return SimpleNamespace(content=reply)

@@ -16,6 +16,7 @@ from graphrag.config.settings import Secrets
 from graphrag.container import Container
 from graphrag.core.logging import get_logger
 from graphrag.core.redact import safe_detail
+from graphrag.ingestion.status import finalize_file
 from graphrag.jobs import JobStatus, JobStore
 from graphrag.pipelines import IngestPipeline
 
@@ -26,7 +27,15 @@ log = get_logger(__name__)
 _REDIS_URL = Secrets().redis_url
 
 
-async def ingest_task(ctx: dict, job_id: str, path: str, user_id: str | None) -> None:
+async def ingest_task(
+    ctx: dict,
+    job_id: str,
+    path: str,
+    user_id: str | None,
+    max_chunks: int | None = None,
+    file_id: str | None = None,
+    shelf: str | None = None,
+) -> None:
     container: Container = ctx["container"]
     store: JobStore = ctx["jobs"]
     # `owner` on every write, including the failure path: the status endpoint
@@ -35,10 +44,18 @@ async def ingest_task(ctx: dict, job_id: str, path: str, user_id: str | None) ->
     store.set(JobStatus(job_id, status="running", owner=user_id))
     try:
         # The pipeline is blocking (embeddings, Neo4j) — run it off the event loop.
-        stats = await asyncio.to_thread(IngestPipeline(container).run, path, user_id)
+        # `max_chunks` is the caller's quota: without it an off-process ingest
+        # was the one path that could write past the chunk ceiling. `shelf`
+        # names the corpus; dropping it would file every worker-run ingest on
+        # the user's default shelf regardless of where they uploaded it.
+        stats = await asyncio.to_thread(
+            IngestPipeline(container, max_chunks=max_chunks).run, path, user_id, shelf
+        )
         store.set(
             JobStatus(
-                job_id, status="done", documents=stats.documents, chunks=stats.chunks,
+                job_id,
+                status="partial" if stats.partial else "done",
+                documents=stats.documents, chunks=stats.chunks,
                 entities=stats.entities, relations=stats.relations, owner=user_id,
             )
         )
@@ -47,6 +64,9 @@ async def ingest_task(ctx: dict, job_id: str, path: str, user_id: str | None) ->
         store.set(
             JobStatus(job_id, status="error", detail=safe_detail(exc), owner=user_id)
         )
+    # Same stamp the in-process path applies. Without it a document ingested
+    # off-process stays "uploaded" forever and the UI never shows it as ready.
+    await finalize_file(ctx.get("db"), file_id, store.get(job_id))
 
 
 async def startup(ctx: dict) -> None:
@@ -65,12 +85,30 @@ async def startup(ctx: dict) -> None:
         )
     ctx["container"] = container
     ctx["jobs"] = JobStore(container.redis)
+    # Its own engine: the worker is a separate process, so it cannot share the
+    # API's. Optional — without a database there is simply no file row to stamp.
+    ctx["db"] = None
+    if container.secrets.database_url:
+        try:
+            from graphrag.db import build_engine, build_sessionmaker
+
+            ctx["engine"] = build_engine(container.secrets.database_url)
+            ctx["db"] = build_sessionmaker(ctx["engine"])
+        except Exception as exc:
+            log.warning("worker_database_unavailable", error=str(exc))
     log.info("worker_started", vector_provider=provider)
+
+
+async def shutdown(ctx: dict) -> None:
+    engine = ctx.get("engine")
+    if engine is not None:
+        await engine.dispose()
 
 
 class WorkerSettings:
     functions = [ingest_task]
     on_startup = startup
+    on_shutdown = shutdown
     redis_settings = RedisSettings.from_dsn(_REDIS_URL)
     max_jobs = int(os.environ.get("GRAPHRAG_WORKER_CONCURRENCY", "2"))
     keep_result = 3600

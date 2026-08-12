@@ -1,38 +1,68 @@
 # Deployment
 
-Target: a single small VPS — **2 vCPU, 8 GB RAM, 60 GB SSD**, any provider.
-Everything below assumes that shape; on a bigger box the only thing that changes
-is the memory caps.
+Target: a single VPS — **4 vCPU, 12 GB RAM, ~100 GB SSD**, any provider.
+Everything below assumes that shape; on a different box the only thing that
+changes is the memory caps.
 
 Nothing here is host-specific: it is Docker Compose plus a reverse proxy, so it
 runs the same on a VPS, a home server, or a laptop. The only external
 requirements are a domain whose A record points at the box, ports 80 and 443
 open, and outbound HTTPS to whichever model providers you configure.
 
+Securing the box the stack runs on is a separate job from securing the stack,
+and this document only covers the second. Before a deployment takes traffic,
+harden the host itself: SSH to key-only with no root login, a firewall that
+allows 80/443 and SSH and nothing else, unattended security updates, and swap
+so a build cannot OOM-kill the database.
+
+**One trap is worth stating here, because it bites almost everyone:** a plain
+`ufw deny 5432` does **not** close a container port. Docker writes its own
+iptables rules in the `DOCKER` chain, which is evaluated before ufw's, so a
+service published to `0.0.0.0` stays reachable no matter what ufw says. The
+control that actually works is the one this repo already uses — the `127.0.0.1:`
+prefix on every `ports:` entry except the proxy's. `make ports` fails if one
+ever goes missing. If you want a firewall backstop as well, it has to be a rule
+in the `DOCKER-USER` chain, which *is* evaluated first.
+
 ## What runs
 
-| Service | Memory cap | Why it's there |
-| --- | --- | --- |
-| `api` | 2 GB | FastAPI + the agent. Also runs ingest (see below). |
-| `neo4j` | 1.5 GB | The knowledge graph. Heap 640m + pagecache 320m fits inside with JVM headroom. |
-| `postgres` | 768 MB | Accounts, limits, usage, chat history, agent memory. |
-| `redis` | 256 MB | Caches, rate-limit windows, live job status. All rebuildable. |
-| `guardrails` | 256 MB | Screens every `/query` in and out. |
-| `proxy` | 128 MB | Caddy: TLS, both web apps' static files, and the API reverse proxy. The public entrypoint. |
+| Service | Memory cap | CPU cap | Why it's there |
+| --- | --- | --- | --- |
+| `api` | 3 GB | 3 | FastAPI + the agent. Also runs ingest (see below). |
+| `neo4j` | 2.5 GB | 2 | The knowledge graph. Heap 1g + pagecache 768m fits inside with JVM headroom. |
+| `postgres` | 1 GB | 1 | Accounts, limits, usage, chat history, agent memory. |
+| `redis` | 384 MB | 0.5 | Caches, rate-limit windows, live job status. All rebuildable. |
+| `guardrails` | 512 MB | 1 | Screens every `/query` in and out — a full core because it is in the path of every answer. |
+| `proxy` | 256 MB | 1 | Caddy: TLS, both web apps' static files, and the API reverse proxy. The public entrypoint. |
 
-That's **4.88 GB** of limits across 6 containers, leaving room for the OS and
-page cache. Measured idle draw is about 0.9 GB; the caps are headroom for
-ingest, not steady state.
+That's **7.6 GB** of limits across 6 containers. Measured idle draw is about
+0.9 GB; the caps are headroom for ingest, not steady state.
+
+The remaining ~4 GB is deliberately unallocated, and it is not slack. Each
+tenant's vectors live in a `data/vectors/*.duckdb` file read through the **host
+page cache**, so memory the containers do not claim is exactly what keeps a
+vector scan off the disk. A `docker compose build` — two `npm ci` plus two
+`vite build` — wants around a GB of its own on top. Handing the last 4 GB out
+as container caps would make queries slower, not faster.
+
+The CPU caps sum to 8.5 on 4 cores on purpose: they are ceilings that stop one
+service starving the others under load, not reservations. **The API still runs
+a single uvicorn worker** and more cores do not change that — the DuckDB vector
+provider takes an exclusive lock per tenant file, so a second worker process
+would fight the first for it. The extra cores go to ingest fan-out
+(`ingestion.max_concurrency`, now 3) and to keeping Neo4j, Postgres and the
+guard off each other's toes.
 
 Three services are off by default: `ollama` (profile `local`), `worker`
 (profile `worker`), and the whole llmlens observability stack (profile
 `observability`). **llmlens is not part of this deployment** — it adds
 ClickHouse plus its own Redis, api, worker and dashboard, roughly another
-4.7 GB, which does not fit beside the RAG stack on an 8 GB box. `.env.example`
-therefore sets `COMPOSE_FILE` to the base plus the guardrails overlay and
-leaves `COMPOSE_PROFILES` unset, so a plain `docker compose up -d` brings up
-exactly the six above. See [INTEGRATIONS.md](INTEGRATIONS.md) for what it
-costs to add it later.
+4.6 GB. Even at 12 GB that does not fit: 7.6 + 4.6 is 12.2 GB of caps with
+nothing left for the OS. Adding it means a 16 GB box, or trimming the caps
+above first. `.env.example` therefore sets `COMPOSE_FILE` to the base plus the
+guardrails overlay and leaves `COMPOSE_PROFILES` unset, so a plain
+`docker compose up -d` brings up exactly the six above. See
+[INTEGRATIONS.md](INTEGRATIONS.md) for what it costs to add it later.
 
 **No torch.** The production profile uses Cohere for embeddings and reranking,
 so the ~3.9 GB of CUDA libraries `sentence-transformers` would pull in are never
@@ -177,7 +207,11 @@ on the wire, including session cookies and passwords.
 Every published port except the proxy's 80/443 is bound to `127.0.0.1`, so
 from the network only the proxy exists. Neo4j browser, Postgres, Redis and the
 raw API are reachable from the box itself (or over an SSH tunnel, e.g.
-`ssh -L 7474:localhost:7474 you@host`), never from outside.
+`ssh -L 7474:localhost:7474 you@host`), never from outside. That binding is the
+control, and `make ports` is the check that it stayed that way — a dropped
+prefix is a database on the public internet. A `DOCKER-USER` firewall rule is
+the backstop for the day one goes missing anyway (see the note at the top of
+this document on why `ufw deny` alone is not).
 
 ## What the deployment does not publish
 
@@ -234,10 +268,28 @@ the ids that appear in URLs are all checked against the caller:
 | threads, messages | same, and a thread you don't own is **404, not 403** |
 | retrieval, agent memory | scoped per tenant, keyed `tenant:thread` |
 | ingest job status | authenticated, and matched against the job's owner |
+| server-side paths | **admin only, single file** — see below |
 | `/admin/*` | fail-closed 403; a user API key is not an admin key |
 
 404 rather than 403 throughout, deliberately: a 403 for a real id and a 404 for
 an invented one lets a caller enumerate which ids exist.
+
+**Server-side path ingest is an operator tool, not a user one.** `POST /ingest`
+accepts a path under `data/` as well as a URL, and `data/uploads` is where every
+tenant's documents land. Two controls, because either alone leaves a hole:
+
+- the caller must be an **admin** — checked before the path is resolved, so the
+  400/404 difference cannot be used to map the disk;
+- the path must be a **single file**. Containment in `data/` was the whole check
+  once, and it accepted a directory — which `iter_documents` walks recursively,
+  so `path=data/uploads` copied every other account's documents into the
+  caller's own corpus, queryable afterwards through `/query` and `/search`.
+
+A URL, by contrast, is the caller's own content and needs no special role. It is
+metered exactly like an upload: the same per-file cap (`min(api.max_upload_mb,
+max_file_mb)`), the same file and storage slots, the same chunk ceiling, and a
+`files` row so it can be deleted again. Previously it had none of those, which
+made a URL the cheap way past every document quota at once.
 
 **URL ingest is restricted to public addresses.** `POST /ingest` takes a URL and
 the server fetches it, which without a destination check is a server-side
@@ -440,10 +492,9 @@ make proxy-check     # caddy validate, without touching the running stack
 ```
 
 The web apps are the opposite: their built files live inside the image, so a UI
-change needs `--build`. That build runs two `npm ci` + `vite build` stages, which
-adds a minute or two on a 2 vCPU box — `make up` does it for you. Run
-`docker builder prune` occasionally; node_modules layers accumulate on a 60 GB
-disk.
+change needs `--build`. That build runs two `npm ci` + `vite build` stages,
+which is about a minute on 4 vCPU — `make up` does it for you. Run
+`docker builder prune` occasionally; node_modules layers accumulate.
 
 **A schema change needs both steps.** Rebuilding the API without migrating leaves
 new columns missing, and the first request that selects one returns a 500 — the

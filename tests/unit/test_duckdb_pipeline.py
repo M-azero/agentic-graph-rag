@@ -62,6 +62,7 @@ class _GraphStore:
     def __init__(self):
         self.chunks: list = []
         self.deleted: list[str] = []
+        self.linked: list = []
 
     def setup(self):
         pass
@@ -73,12 +74,18 @@ class _GraphStore:
     def upsert_chunks(self, chunks):
         self.chunks.extend(chunks)
 
+    def link_chunk_sequence(self, chunks):
+        self.linked.append(list(chunks))
+
 
 class _Tenant:
-    def __init__(self, vector_store, graph_store, user_id="alice"):
+    def __init__(self, vector_store, graph_store, user_id="alice", corpus=None):
         self.vector_store = vector_store
         self.graph_store = graph_store
         self.user_id = user_id
+        # Equal to `user_id` unless a shelf is named — which is exactly what the
+        # real Tenant does for the default shelf.
+        self.corpus = corpus if corpus is not None else user_id
 
 
 class _Container:
@@ -96,7 +103,7 @@ class _Container:
         self.graph_store = _GraphStore()
         self._tenant = _Tenant(self.vector_store, self.graph_store, corpus)
 
-    def tenant(self, user_id=None):
+    def tenant(self, user_id=None, shelf=None):
         return self._tenant
 
 
@@ -124,6 +131,15 @@ def test_chunk_nodes_still_reach_the_graph(tmp_path):
     c = _Container(tmp_path / "vec")
     IngestPipeline(c).run(_write(tmp_path, "notes.txt", "alpha\nbeta\n"))
     assert len(c.graph_store.chunks) == 2
+
+
+def test_chunks_are_linked_under_a_non_neo4j_vector_provider(tmp_path):
+    """The :NEXT chain is laid down by the pipeline, not by whichever store
+    happened to write the nodes — so it exists under duckdb too. Linking inside
+    `upsert_chunks` would have made the chain neo4j-only."""
+    c = _Container(tmp_path / "vec")
+    IngestPipeline(c).run(_write(tmp_path, "notes.txt", "alpha\nbeta\n"))
+    assert [ch.index for ch in c.graph_store.linked[0]] == [0, 1]
 
 
 def test_reingest_replaces_instead_of_duplicating(tmp_path):

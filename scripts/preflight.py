@@ -155,6 +155,46 @@ def check_rerank(report: Report, settings, secrets, quick: bool):
     return report.add("rerank", target, OK)
 
 
+# --- credential hygiene --------------------------------------------------------
+
+# Every placeholder this repo itself publishes (.env.example, compose
+# fallbacks). Anyone on the internet can read these, so a deployment still
+# using one has a password in name only.
+_PUBLISHED_DEFAULTS = {"", "12345678", "change-me", "please-change-me"}
+
+
+def check_credentials(report: Report, settings, secrets):
+    """Fail a production deploy that still runs on the repo's own placeholders.
+
+    The loopback port bindings contain the blast radius, but that containment
+    is one edited `ports:` line thick — and these are the passwords guarding
+    every account row. Gate on `auth.enabled` because that is what separates
+    the profiles that face strangers from the dev ones.
+    """
+    hard = FAIL if settings.auth.enabled else WARN
+    if (secrets.neo4j_password or "") in _PUBLISHED_DEFAULTS:
+        report.add(
+            "credentials", "neo4j", hard,
+            "GRAPHRAG_NEO4J_PASSWORD is a published placeholder - set a real one "
+            "(new value needs a fresh volume; it bakes in at first start)",
+        )
+    else:
+        report.add("credentials", "neo4j", OK)
+
+    if secrets.database_url:
+        from urllib.parse import urlsplit
+
+        password = urlsplit(secrets.database_url).password or ""
+        if password in _PUBLISHED_DEFAULTS:
+            report.add(
+                "credentials", "postgres", hard,
+                "the database password is a published placeholder - set "
+                "GRAPHRAG_POSTGRES_PASSWORD (bakes in at first start, like neo4j)",
+            )
+        else:
+            report.add("credentials", "postgres", OK)
+
+
 # --- infrastructure ----------------------------------------------------------
 
 def check_neo4j(report: Report, settings, secrets):
@@ -265,7 +305,15 @@ def check_guardrails(report: Report, settings, secrets) -> list[str]:
     provider = body.get("provider", "?")
     chain: list[str] = list(body.get("chain") or [])
     if provider == "mock":
-        report.add("guardrails", url, WARN, "judge is 'mock' - nothing is really screened")
+        # The compose overlay defaults the judge to `mock` so the stack comes
+        # up with no key — fine on a laptop, but a deployment that faces
+        # strangers with safety.enabled and a mock judge is *reporting* a
+        # safety layer it does not have. Same auth.enabled gate as the
+        # credential check: that is the line between dev and production.
+        report.add(
+            "guardrails", url, FAIL if settings.auth.enabled else WARN,
+            "judge is 'mock' - nothing is really screened; set GUARD_LLM_PROVIDER",
+        )
         return chain
 
     # A judge chain is only as configured as its links. Links get DROPPED at
@@ -397,6 +445,7 @@ def main() -> int:
 
     print(f"\nProfile: {secrets.profile}")
 
+    check_credentials(report, settings, secrets)
     check_neo4j(report, settings, secrets)
     check_postgres(report, settings, secrets)
     check_redis(report, secrets)

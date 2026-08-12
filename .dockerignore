@@ -1,7 +1,7 @@
 # Shared build context for the two images built from the repo root:
 #
 #   docker/Dockerfile        the API — needs pyproject.toml, README.md,
-#                            alembic.ini, src/, configs/, migrations/,
+#                            alembic.ini, src/, configs/, prompts/, migrations/,
 #                            docker/entrypoint.sh, integrations/llmlens/sdk
 #   docker/Dockerfile.proxy  the proxy — needs frontend/ and admin/, which have
 #                            no common parent below the repo root

@@ -231,7 +231,7 @@ async def test_api_key_resolves_to_its_owner(db, email_sender):
     _svc, principal, _token = await _verified(db, email_sender)
     store = PgKeyStore(db)
 
-    key = await store.create_key(principal.user_id, label="ci")
+    _key_id, key = await store.create_key(principal.user_id, label="ci")
     assert key.startswith("grk_")
 
     owner = await store.resolve(key)
@@ -247,7 +247,7 @@ async def test_unknown_key_resolves_to_nobody(db, email_sender):
 async def test_revoked_key_stops_working(db, email_sender):
     _svc, principal, _token = await _verified(db, email_sender)
     store = PgKeyStore(db)
-    key = await store.create_key(principal.user_id)
+    _key_id, key = await store.create_key(principal.user_id)
 
     assert await store.revoke_user(principal.user_id) == 1
     assert await store.resolve(key) is None
@@ -263,7 +263,7 @@ async def test_suspended_owner_disables_their_keys(db, email_sender):
 
     _svc, principal, _token = await _verified(db, email_sender)
     store = PgKeyStore(db)
-    key = await store.create_key(principal.user_id)
+    _key_id, key = await store.create_key(principal.user_id)
     assert await store.resolve(key) is not None
 
     async with session_scope(db) as s:
@@ -276,13 +276,18 @@ async def test_suspended_owner_disables_their_keys(db, email_sender):
 async def test_revoking_one_key_leaves_the_others(db, email_sender):
     _svc, principal, _token = await _verified(db, email_sender)
     store = PgKeyStore(db)
-    keep = await store.create_key(principal.user_id, "keep")
-    drop = await store.create_key(principal.user_id, "drop")
+    _keep_id, keep = await store.create_key(principal.user_id, "keep")
+    drop_id, drop = await store.create_key(principal.user_id, "drop")
 
+    # The id `create_key` hands back is the row it actually inserted. It used to
+    # be recovered afterwards by listing the user's keys newest-first, which
+    # ties for two keys created in the same second — so the caller could revoke
+    # a different key from the one whose plaintext it was holding.
     rows = await store.list_keys(principal.user_id)
-    drop_id = next(r.id for r in rows if r.label == "drop")
-    assert await store.revoke_one(principal.user_id, drop_id) is True
+    assert drop_id == next(r.id for r in rows if r.label == "drop")
+    assert _keep_id == next(r.id for r in rows if r.label == "keep")
 
+    assert await store.revoke_one(principal.user_id, drop_id) is True
     assert await store.resolve(drop) is None
     assert await store.resolve(keep) is not None
 
@@ -292,8 +297,7 @@ async def test_cannot_revoke_another_users_key(db, email_sender):
     _s2, bob, _t2 = await _verified(db, email_sender, "bob@example.com")
     store = PgKeyStore(db)
 
-    alice_key = await store.create_key(alice.user_id)
-    alice_key_id = (await store.list_keys(alice.user_id))[0].id
+    alice_key_id, alice_key = await store.create_key(alice.user_id)
 
     assert await store.revoke_one(bob.user_id, alice_key_id) is False
     assert await store.resolve(alice_key) is not None

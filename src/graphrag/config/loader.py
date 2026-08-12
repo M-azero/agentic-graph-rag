@@ -39,8 +39,18 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
     return out
 
 
-# Providers build_chat_model knows how to construct (see graphrag/llm/factory.py).
-_LLM_PROVIDERS = {"ollama", "anthropic", "openai", "gemini", "deepseek", "qwen"}
+def _llm_providers() -> set[str]:
+    """Providers `build_chat_model` can actually construct.
+
+    Derived from the factory rather than restated here. The hand-maintained copy
+    drifted: it omitted `deepinfra` and `cohere`, which is the entire fallback
+    chain of the production profile, so `GRAPHRAG_LLM=deepinfra:...` — the
+    documented one-line model toggle — raised a ConfigError and took the
+    container down at startup for a provider the factory supports fine.
+    """
+    from graphrag.llm.factory import chat_providers
+
+    return chat_providers()
 
 
 def _apply_llm_override(merged: dict[str, Any], override: str) -> None:
@@ -53,13 +63,14 @@ def _apply_llm_override(merged: dict[str, Any], override: str) -> None:
     Anthropic `thinking`, Ollama `num_ctx`) and would be rejected or wrong on
     another provider's client.
     """
+    providers = _llm_providers()
     provider, sep, model = override.partition(":")
     provider = provider.strip().lower()
     model = model.strip()
-    if not sep or not model or provider not in _LLM_PROVIDERS:
+    if not sep or not model or provider not in providers:
         raise ConfigError(
             "GRAPHRAG_LLM must be '<provider>:<model>' with provider one of "
-            f"{sorted(_LLM_PROVIDERS)}; got: {override!r}"
+            f"{sorted(providers)}; got: {override!r}"
         )
     llm = merged.setdefault("llm", {})
     if (llm.get("provider"), llm.get("model")) != (provider, model):

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from graphrag.core.types import RetrievedChunk
 
@@ -13,24 +13,57 @@ class Source(BaseModel):
     snippet: str
     score: float
     retriever: str
+    # Whether the answer actually cited this source, as opposed to retrieval
+    # merely surfacing it. Retrieval over-fetches by design, so the two are
+    # routinely different and a client can now show "evidence used" apart from
+    # "also found". Default False keeps `/search`, which has no answer to check
+    # against, honest rather than optimistic.
+    cited: bool = False
 
     @classmethod
-    def from_chunk(cls, c: RetrievedChunk) -> Source:
+    def from_chunk(cls, c: RetrievedChunk, cited: bool = False) -> Source:
         snippet = c.text if len(c.text) <= 400 else c.text[:400] + "…"
         return cls(
             chunk_id=c.chunk_id, source=c.source, snippet=snippet,
-            score=round(c.score, 4), retriever=c.retriever,
+            score=round(c.score, 4), retriever=c.retriever, cited=cited,
         )
 
 
+# A question is a question. The cap is far above any real one and far below
+# what makes the request expensive: the text is embedded, screened by the guard,
+# and then resent on every turn of the agent's tool loop, so an unbounded field
+# is an unbounded bill for one unit of message quota. Bounded here rather than
+# only at the proxy so the API is safe when something else fronts it.
+_MAX_QUESTION_CHARS = 8000
+_MAX_THREAD_ID_CHARS = 128
+_MAX_MODEL_ID_CHARS = 128
+_MAX_PRESET_ID_CHARS = 32
+# A UUID in any spelling anyone writes one. Bounded for the same reason the
+# others are: these are looked up, and an unbounded string is an unbounded key.
+_MAX_ID_CHARS = 64
+_MAX_SHELF_NAME_CHARS = 80
+
+
 class QueryRequest(BaseModel):
-    question: str = Field(..., min_length=1)
+    question: str = Field(..., min_length=1, max_length=_MAX_QUESTION_CHARS)
     style: str = Field("detailed", description="concise | detailed | technical | eli5")
-    thread_id: str = Field("default", description="conversation id for multi-turn memory")
+    # The job preset (see agent/presets.py). Unknown values clamp to `general`,
+    # which defers to `style` — so a client that sends neither behaves exactly
+    # as it did before presets existed.
+    preset: str | None = Field(None, max_length=_MAX_PRESET_ID_CHARS)
+    thread_id: str = Field(
+        "default",
+        max_length=_MAX_THREAD_ID_CHARS,
+        description="conversation id for multi-turn memory",
+    )
+    # Which shelf to search. Omitted -> the default shelf. Ignored when
+    # `thread_id` names a conversation that is already pinned to one: a thread's
+    # shelf is fixed at creation, and its memory is keyed on that shelf's corpus.
+    shelf_id: str | None = Field(None, max_length=_MAX_ID_CHARS)
     # None -> the server default (api.stream in config) decides.
     stream: bool | None = None
     # Chat model id from the allowed list; unknown ids fall back to the default.
-    model: str | None = None
+    model: str | None = Field(None, max_length=_MAX_MODEL_ID_CHARS)
 
 
 class ToolCall(BaseModel):
@@ -58,8 +91,10 @@ class QueryResponse(BaseModel):
 
 
 class SearchRequest(BaseModel):
-    query: str = Field(..., min_length=1)
-    k: int = 8
+    query: str = Field(..., min_length=1, max_length=_MAX_QUESTION_CHARS)
+    # Bounded on both sides: a negative k slices a result list from the wrong
+    # end, and a huge one is only ever capped by chance (`candidate_k`).
+    k: int = Field(8, ge=1, le=50)
 
 
 class SearchResponse(BaseModel):
@@ -67,11 +102,32 @@ class SearchResponse(BaseModel):
 
 
 class CompareRequest(BaseModel):
-    subjects: list[str] = Field(..., min_length=2)
-    aspects: list[str] = []
+    """A side-by-side comparison.
+
+    `subjects` is capped because it fans out: the composed question drives the
+    agent's `compare` tool, which runs one full hybrid retrieval *per subject* —
+    an embedding call, three Neo4j queries and a rerank each, and under a
+    generative reranker that is `candidate_k` model calls each. Unbounded, one
+    request costing one unit of message quota could issue thousands.
+    """
+
+    subjects: list[str] = Field(..., min_length=2, max_length=8)
+    aspects: list[str] = Field(default=[], max_length=12)
     style: str = "detailed"
-    thread_id: str = "default"
-    model: str | None = None
+    preset: str | None = Field(None, max_length=_MAX_PRESET_ID_CHARS)
+    thread_id: str = Field("default", max_length=_MAX_THREAD_ID_CHARS)
+    shelf_id: str | None = Field(None, max_length=_MAX_ID_CHARS)
+    model: str | None = Field(None, max_length=_MAX_MODEL_ID_CHARS)
+
+    @field_validator("subjects", "aspects")
+    @classmethod
+    def _bound_each_entry(cls, values: list[str]) -> list[str]:
+        """The list length is not the only dimension — one 5 MB subject is the
+        same problem wearing a different hat."""
+        for value in values:
+            if len(value) > 200:
+                raise ValueError("each entry must be 200 characters or fewer")
+        return values
 
 
 class IngestResponse(BaseModel):
@@ -96,12 +152,67 @@ class StoredFile(BaseModel):
     file_id: str
     name: str
     source: str
+    shelf_id: str | None = None
 
 
 class FileList(BaseModel):
     files: list[StoredFile] = []
+    # `used` and `limit` are per account, not per shelf: the file quota is
+    # something you hold across every shelf, so a panel showing one shelf's
+    # documents must still show the whole allowance or "3/10" would mean
+    # something different on every shelf.
     used: int = 0
     limit: int = 0
+
+
+# --- shelves -----------------------------------------------------------------
+
+class ShelfInfo(BaseModel):
+    """One shelf. `id` is null for the implicit default shelf of an account
+    that has no rows yet — clients send it back as-is, and null means the
+    default, so they never need to know the difference."""
+
+    id: str | None = None
+    name: str
+    slug: str = ""
+    preset: str = "general"
+    is_default: bool = False
+    files: int = 0
+
+
+class ShelfList(BaseModel):
+    shelves: list[ShelfInfo] = []
+    max_shelves: int = 0
+
+
+class ShelfCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=_MAX_SHELF_NAME_CHARS)
+    preset: str | None = Field(None, max_length=_MAX_PRESET_ID_CHARS)
+
+
+class ShelfUpdate(BaseModel):
+    """Name and preset only. A shelf's slug is its storage namespace and is
+    fixed at creation — changing it would leave every chunk, entity and summary
+    the shelf holds under a corpus nothing queries."""
+
+    name: str | None = Field(None, min_length=1, max_length=_MAX_SHELF_NAME_CHARS)
+    preset: str | None = Field(None, max_length=_MAX_PRESET_ID_CHARS)
+
+
+class ShelfDeleted(BaseModel):
+    id: str
+    chunks_removed: int = 0
+    files_removed: int = 0
+
+
+class PresetOption(BaseModel):
+    """One entry of the job picker. The UI renders this list rather than
+    carrying its own copy, so adding a preset server-side offers it."""
+
+    id: str
+    label: str
+    emoji: str = ""
+    description: str = ""
 
 
 class DeleteResponse(BaseModel):
@@ -183,6 +294,7 @@ class Me(BaseModel):
     authenticated: bool = True
     models: list[ModelOption] = []
     default_model: str = ""
+    presets: list[PresetOption] = []
 
 
 class APIKeyInfo(BaseModel):
@@ -210,6 +322,8 @@ class ThreadInfo(BaseModel):
     title: str
     created_at: str = ""
     updated_at: str = ""
+    # The shelf this conversation asks about; null is the default shelf.
+    shelf_id: str | None = None
 
 
 class ThreadList(BaseModel):
@@ -218,6 +332,8 @@ class ThreadList(BaseModel):
 
 class ThreadCreate(BaseModel):
     title: str = Field("New chat", max_length=120)
+    # Pinned at creation and never changed afterwards — see `Thread.shelf_id`.
+    shelf_id: str | None = Field(None, max_length=_MAX_ID_CHARS)
 
 
 class ThreadUpdate(BaseModel):

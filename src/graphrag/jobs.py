@@ -6,9 +6,15 @@ from __future__ import annotations
 
 import contextlib
 import json
+from collections import OrderedDict
 from dataclasses import asdict, dataclass
 
 _TTL = 86400  # keep job records for a day
+
+# The in-process fallback has no TTL to expire entries the way Redis does, so it
+# is bounded by count instead. Without this it is a slow leak in exactly the
+# configuration that has no Redis to trim it.
+_MEM_MAX = 1000
 
 
 @dataclass
@@ -41,7 +47,7 @@ class JobStatus:
 class JobStore:
     def __init__(self, redis_client=None) -> None:
         self._redis = redis_client
-        self._mem: dict[str, JobStatus] = {}
+        self._mem: OrderedDict[str, JobStatus] = OrderedDict()
 
     @staticmethod
     def _key(job_id: str) -> str:
@@ -49,6 +55,9 @@ class JobStore:
 
     def set(self, status: JobStatus) -> None:
         self._mem[status.job_id] = status
+        self._mem.move_to_end(status.job_id)
+        while len(self._mem) > _MEM_MAX:
+            self._mem.popitem(last=False)  # evict the oldest job
         if self._redis is not None:
             with contextlib.suppress(Exception):
                 self._redis.setex(self._key(status.job_id), _TTL, json.dumps(status.to_dict()))

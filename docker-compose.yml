@@ -11,8 +11,14 @@
 #   ollama    local models                profile: local
 #
 # RAM / CPU per service are capped via .env (the *_MEM_LIMIT / *_CPU_LIMIT
-# knobs). The defaults target a 2 vCPU / 8 GB VPS and sum to ~4.7 GB of limits,
-# leaving room for the OS and page cache; raise them on a bigger box.
+# knobs). The defaults target a 4 vCPU / 12 GB VPS and sum to ~7.6 GB of limits,
+# leaving ~4 GB for the OS, the host page cache (which is what makes the DuckDB
+# vector scans fast) and a `docker compose build`. Raise them on a bigger box.
+#
+# Only the proxy publishes to the network. Every other `ports:` entry below is
+# bound to 127.0.0.1 and is reached over an SSH tunnel. `make ports` fails if a
+# prefix ever goes missing — that binding is the control, because `ufw deny`
+# does not close a published container port (Docker's iptables rules run first).
 #
 # Ingest runs inside the API by default. The separate `worker` profile exists
 # for deployments using the neo4j vector provider — it CANNOT be used with the
@@ -30,11 +36,18 @@ services:
     environment:
       NEO4J_AUTH: neo4j/${GRAPHRAG_NEO4J_PASSWORD:-12345678}
       NEO4J_PLUGINS: '["apoc"]'
-      NEO4J_dbms_security_procedures_unrestricted: apoc.*
+      # Only the namespaces the code calls (apoc.merge.relationship,
+      # apoc.refactor.mergeNodes) — NOT apoc.*, which would also unlock
+      # apoc.load.* and apoc.export.*: network and file reach from inside the
+      # database, a gift to any Cypher execution nobody has found yet. Both
+      # call sites degrade to plain Cypher if APOC is missing, so narrowing
+      # this can never take the deployment down.
+      NEO4J_dbms_security_procedures_unrestricted: apoc.merge.*,apoc.refactor.*
       # Heap + pagecache must fit inside NEO4J_MEM_LIMIT with room for the JVM
-      # itself; 640m + 320m under a 1536m cap leaves ~570m of headroom.
-      NEO4J_server_memory_heap_max__size: ${NEO4J_HEAP:-640m}
-      NEO4J_server_memory_pagecache_size: ${NEO4J_PAGECACHE:-320M}
+      # itself (metaspace, thread stacks, direct buffers — allow ~500m);
+      # 1g + 768m under a 2560m cap leaves ~800m of headroom.
+      NEO4J_server_memory_heap_max__size: ${NEO4J_HEAP:-1g}
+      NEO4J_server_memory_pagecache_size: ${NEO4J_PAGECACHE:-768M}
     # Loopback only — the API reaches Neo4j in-network as neo4j:7687. On a VPS
     # a 0.0.0.0 bind would expose the database (with a guessable password) to
     # the internet; use an SSH tunnel for the browser UI when remote.
@@ -42,7 +55,7 @@ services:
     volumes: ["neo4j_data:/data"]
     deploy:
       resources:
-        limits: { cpus: "${NEO4J_CPU_LIMIT:-1}", memory: "${NEO4J_MEM_LIMIT:-1536m}" }
+        limits: { cpus: "${NEO4J_CPU_LIMIT:-2}", memory: "${NEO4J_MEM_LIMIT:-2560m}" }
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:7474 || exit 1"]
       interval: 10s
@@ -56,20 +69,25 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-graphrag}
       POSTGRES_PASSWORD: ${GRAPHRAG_POSTGRES_PASSWORD:-change-me}
       POSTGRES_DB: ${POSTGRES_DB:-graphrag}
-    # Sized for the 768m cap: shared_buffers is the classic 25%, and
+    # Sized for the 1g cap: shared_buffers is the classic 25%, and
     # max_connections is deliberately small — the API pool (5+5) plus the
     # checkpointer pool (4) plus headroom, not the default 100 idle backends.
     # 64 (not 40) leaves room for the llmlens api/worker pools, which share
     # this server (separate `llmlens` database) under the integrations overlay.
+    #
+    # work_mem is per sort/hash NODE, not per connection: the worst case is
+    # roughly max_connections x work_mem x a few, so it stays modest even with
+    # memory to spare. shared_buffers is where the extra GB actually goes.
     command: >
-      postgres -c shared_buffers=192MB -c max_connections=64
-               -c work_mem=8MB -c maintenance_work_mem=64MB
+      postgres -c shared_buffers=256MB -c max_connections=64
+               -c work_mem=12MB -c maintenance_work_mem=128MB
+               -c effective_cache_size=768MB
     # Loopback only — in-network clients use postgres:5432.
     ports: ["127.0.0.1:5432:5432"]
     volumes: ["postgres_data:/var/lib/postgresql/data"]
     deploy:
       resources:
-        limits: { cpus: "${POSTGRES_CPU_LIMIT:-1}", memory: "${POSTGRES_MEM_LIMIT:-768m}" }
+        limits: { cpus: "${POSTGRES_CPU_LIMIT:-1}", memory: "${POSTGRES_MEM_LIMIT:-1g}" }
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-graphrag} -d ${POSTGRES_DB:-graphrag}"]
       interval: 10s
@@ -84,8 +102,11 @@ services:
     # allkeys-lru eviction.
     image: redis:7-alpine
     restart: unless-stopped
+    # maxmemory sits BELOW the container cap on purpose: it bounds the keyspace,
+    # while fragmentation and copy-on-write sit on top of it. Set equal to the
+    # cap, Redis gets OOM-killed at the point it should have started evicting.
     command: >
-      redis-server --maxmemory ${REDIS_MAXMEMORY:-192mb}
+      redis-server --maxmemory ${REDIS_MAXMEMORY:-288mb}
                    --maxmemory-policy allkeys-lru --save ""
     # Loopback only — Redis has NO auth here; a 0.0.0.0:6379 bind on a public
     # host is a well-known instant compromise. In-network clients use redis:6379.
@@ -94,7 +115,7 @@ services:
     # volume also avoids an RDB the plain image cannot read.
     deploy:
       resources:
-        limits: { cpus: "${REDIS_CPU_LIMIT:-0.5}", memory: "${REDIS_MEM_LIMIT:-256m}" }
+        limits: { cpus: "${REDIS_CPU_LIMIT:-0.5}", memory: "${REDIS_MEM_LIMIT:-384m}" }
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -115,7 +136,7 @@ services:
       # GRAPHRAG_OLLAMA_BASE_URL_INTERNAL=http://ollama:11434 in .env.
       GRAPHRAG_OLLAMA_BASE_URL: ${GRAPHRAG_OLLAMA_BASE_URL_INTERNAL:-http://host.docker.internal:11434}
       # Cap CPU-thread fan-out so limits are actually respected.
-      OMP_NUM_THREADS: ${OMP_NUM_THREADS:-2}
+      OMP_NUM_THREADS: ${OMP_NUM_THREADS:-3}
       TOKENIZERS_PARALLELISM: "false"
     extra_hosts: &host_gateway
       # On Linux, host.docker.internal doesn't exist unless mapped explicitly
@@ -131,7 +152,7 @@ services:
     volumes: ["./data:/app/data"]
     deploy:
       resources:
-        limits: { cpus: "${API_CPU_LIMIT:-2}", memory: "${API_MEM_LIMIT:-2g}" }
+        limits: { cpus: "${API_CPU_LIMIT:-3}", memory: "${API_MEM_LIMIT:-3g}" }
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 10s
@@ -194,9 +215,11 @@ services:
     environment:
       SITE_ADDRESS: ${SITE_ADDRESS:-:80}   # -> localhost or a domain to enable HTTPS
       TLS_EMAIL: ${TLS_EMAIL:-}
-      # Caddy refuses bodies above this before they reach the API. Keep it >=
-      # api.max_upload_mb in configs/*.yaml.
-      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-25}
+      # Caddy refuses bodies above this before they reach the API. Keep it
+      # strictly ABOVE api.max_upload_mb in configs/*.yaml — this bounds the
+      # whole multipart body, the API bounds the file inside it, so equal
+      # values reject a file of exactly the advertised size.
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-26}
     ports: ["80:80", "443:443"]
     volumes:
       # Bind-mounted as well as baked into the image, so fixing the config that
@@ -208,7 +231,7 @@ services:
       api: { condition: service_healthy }
     deploy:
       resources:
-        limits: { cpus: "${PROXY_CPU_LIMIT:-0.5}", memory: "${PROXY_MEM_LIMIT:-128m}" }
+        limits: { cpus: "${PROXY_CPU_LIMIT:-1}", memory: "${PROXY_MEM_LIMIT:-256m}" }
     healthcheck:
       # Caddy's local admin API, not the site: with a real SITE_ADDRESS the site
       # redirects :80 to HTTPS and a plain wget fails on the certificate name.

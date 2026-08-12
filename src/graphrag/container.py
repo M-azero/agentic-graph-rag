@@ -18,11 +18,12 @@ from collections import OrderedDict
 from functools import cached_property
 
 from graphrag.agent import AgentRunner, build_checkpointer
+from graphrag.agent.review.graph import ReviewRunner
 from graphrag.cache import get_redis
 from graphrag.config import Secrets, Settings, load_settings
 from graphrag.core.logging import configure_logging, get_logger
 from graphrag.embeddings.base import Embedder
-from graphrag.ingestion.chunking import build_chunker
+from graphrag.ingestion.chunking import build_chunker, build_chunkers
 from graphrag.ingestion.extraction import LLMGraphExtractor
 from graphrag.llm import build_chat_chain
 from graphrag.ocr import build_ocr
@@ -32,12 +33,20 @@ from graphrag.retrieval import (
     VectorRetriever,
     build_reranker,
 )
+from graphrag.retrieval.plan import RetrievalPlan
 from graphrag.storage import build_graph_store, build_vector_store
 from graphrag.storage.neo4j_client import driver_from_secrets, safe_ident
 
 log = get_logger(__name__)
 
 _USER_RE = re.compile(r"[^a-z0-9_-]+")
+
+# Separates the tenant from the shelf inside a corpus name. A dot, specifically:
+# `_USER_RE` strips it, so neither a sanitized tenant id nor a sanitized shelf
+# slug can ever contain one. That makes `{tenant}.{slug}` unambiguous — exactly
+# one dot in a shelf corpus, none in a default one — which a dash or underscore
+# would not have been, since tenant ids may legitimately hold both.
+SHELF_SEPARATOR = "."
 
 # When Redis is down, don't re-attempt a connection on every access — but do
 # recover without a restart once it's back.
@@ -50,8 +59,38 @@ def sanitize_user(user_id: str) -> str:
     return (clean or "default")[:48]
 
 
+def sanitize_slug(slug: str | None) -> str:
+    """Normalize a shelf slug. Empty means the tenant's default shelf.
+
+    Shorter than a user id because it is only ever a suffix: the pair has to fit
+    a DuckDB filename and a Neo4j property comfortably.
+    """
+    clean = _USER_RE.sub("-", (slug or "").strip().lower()).strip("-")
+    return clean[:32]
+
+
+def corpus_for(user: str, slug: str | None = None) -> str:
+    """The storage namespace for one shelf of one tenant.
+
+    The default shelf is deliberately the bare tenant id rather than something
+    like `{tenant}.default`. Everything ingested before shelves existed lives
+    under that name, so this is what makes those documents the contents of the
+    default shelf instead of data no query can reach any more.
+    """
+    clean = sanitize_slug(slug)
+    return f"{user}{SHELF_SEPARATOR}{clean}" if clean else user
+
+
 class Tenant:
-    """One user's isolated view, built from the container's shared resources."""
+    """One user's isolated view of one shelf, built from the container's shared
+    resources.
+
+    `user_id` identifies the account; `corpus` identifies the shelf and is the
+    real namespace — the two are equal only for the default shelf. Anything that
+    must not leak between shelves (stores, retrievers, conversation memory keys)
+    keys on `corpus`; anything that is about the person (logging, quotas) keys on
+    `user_id`.
+    """
 
     def __init__(self, container: Container, database: str, corpus: str, user_id: str) -> None:
         c = container
@@ -74,9 +113,33 @@ class Tenant:
             checkpointer=c.checkpointer,
             top_k=s.retrieval.top_k, graph_hops=s.retrieval.graph_hops,
             default_style=s.agent.default_style,
+            default_preset=s.agent.default_preset,
             max_tool_iterations=s.agent.max_tool_iterations,
         )
         self._embed_dim = c.embedder.dim
+        self._container = c
+
+    @cached_property
+    def reviewer(self) -> ReviewRunner:
+        """The review loop over this tenant's agent.
+
+        Built lazily: a tenant that never asks a reviewed question never
+        compiles the graph, and `agent.review.enabled` is off by default.
+        """
+        s = self._container.settings
+        return ReviewRunner(
+            self.agent, self._container.llm, self.graph_store,
+            max_rounds=s.agent.review.max_rounds,
+            window_before=s.agent.review.window_before,
+            window_after=s.agent.review.window_after,
+            critic_free_tool_calls=s.agent.review.critic_free_tool_calls,
+            critic_free_chars=s.agent.review.critic_free_chars,
+            base_plan=RetrievalPlan(
+                top_k=s.retrieval.top_k,
+                candidate_k=s.retrieval.candidate_k,
+                graph_hops=s.retrieval.graph_hops,
+            ),
+        )
 
     def setup(self) -> None:
         self.graph_store.setup()
@@ -239,6 +302,13 @@ class Container:
         return build_chunker(self.settings.chunking, self.settings.embeddings, self.embedder)
 
     @cached_property
+    def chunkers(self) -> dict[str, object]:
+        """Every strategy, for the per-document router. One tokenizer load."""
+        return build_chunkers(
+            self.settings.chunking, self.settings.embeddings, self.embedder
+        )
+
+    @cached_property
     def extractor(self) -> LLMGraphExtractor:
         return LLMGraphExtractor(self.extractor_llm)
 
@@ -261,12 +331,20 @@ class Container:
         return GuardrailsClient(cfg, self.secrets.guardrails_api_key)
 
     # -- per-user tenants -----------------------------------------------------
-    def _resolve_scope(self, user: str) -> tuple[str, str]:
-        """Return (database, corpus) for a sanitized user id."""
+    def _resolve_scope(self, user: str, shelf: str | None = None) -> tuple[str, str]:
+        """Return (database, corpus) for a sanitized user id and shelf slug.
+
+        Only the *corpus* varies per shelf; the database stays per user. Under
+        `tenancy.per_tenant_database` that keeps a user's shelves inside their
+        one Neo4j database — a database per shelf would multiply an
+        Enterprise-only resource by however many subjects someone happens to
+        keep, for isolation the corpus tag already provides.
+        """
         t = self.settings.tenancy
+        corpus = corpus_for(user, shelf)
         if t.per_tenant_database:
-            return safe_ident(t.database_prefix + user.replace("-", "_")), user
-        return self.settings.storage.graph.database, user
+            return safe_ident(t.database_prefix + user.replace("-", "_")), corpus
+        return self.settings.storage.graph.database, corpus
 
     def _ensure_database(self, database: str) -> None:
         if not self.settings.tenancy.per_tenant_database:
@@ -277,15 +355,23 @@ class Container:
         except Exception as exc:
             log.warning("per_tenant_database_unavailable", database=database, error=str(exc))
 
-    def tenant(self, user_id: str | None = None) -> Tenant:
+    def tenant(self, user_id: str | None = None, shelf: str | None = None) -> Tenant:
+        """One user's view of one shelf, from cache when it's warm.
+
+        Keyed on the corpus rather than the user: a user with three shelves
+        holds three entries, which is the point — each carries its own stores,
+        retrievers and compiled agent over a separate slice of the graph. They
+        remain cheap wrappers around the container's shared models, so the LRU
+        bound in `tenancy.max_active_tenants` is still counting wrappers.
+        """
         if not self.settings.tenancy.enabled:
             user_id = None  # single-tenant mode: everyone shares default_user
         user = sanitize_user(user_id or self.settings.tenancy.default_user)
-        if user in self._tenants:
-            self._tenants.move_to_end(user)
-            return self._tenants[user]
+        database, corpus = self._resolve_scope(user, shelf)
+        if corpus in self._tenants:
+            self._tenants.move_to_end(corpus)
+            return self._tenants[corpus]
 
-        database, corpus = self._resolve_scope(user)
         tenant = Tenant(self, database, corpus, user)
 
         # Create indexes once per database (constraints/indexes are DB-wide).
@@ -297,11 +383,24 @@ class Container:
             except Exception as exc:  # don't fail the request if Neo4j is briefly down
                 log.warning("tenant_setup_deferred", user=user, error=str(exc))
 
-        self._tenants[user] = tenant
-        self._tenants.move_to_end(user)
+        self._tenants[corpus] = tenant
+        self._tenants.move_to_end(corpus)
         while len(self._tenants) > self.settings.tenancy.max_active_tenants:
             self._tenants.popitem(last=False)  # evict LRU (cheap wrappers only)
         return tenant
+
+    def evict_tenant(self, user: str) -> int:
+        """Drop every cached shelf belonging to `user`, returning how many.
+
+        Used after a purge: the tenant objects hold store wrappers pointed at
+        data that no longer exists, and for DuckDB an open file handle that has
+        to be released before the file can be unlinked.
+        """
+        prefix = user + SHELF_SEPARATOR
+        stale = [k for k in self._tenants if k == user or k.startswith(prefix)]
+        for key in stale:
+            self._tenants.pop(key, None)
+        return len(stale)
 
     # -- lifecycle ------------------------------------------------------------
     def setup_storage(self) -> None:

@@ -22,6 +22,7 @@ from pathlib import Path
 
 from graphrag.container import Container, Tenant
 from graphrag.core.logging import get_logger
+from graphrag.ingestion.chunking.router import route
 from graphrag.ingestion.enrich import build_communities, resolve_entities
 from graphrag.ingestion.loaders import iter_documents
 
@@ -55,11 +56,36 @@ class IngestPipeline:
         self._c = container
         self._max_chunks = max_chunks
 
+    def _chunk(self, document) -> list:
+        """Split one document, routing per document when that is enabled.
+
+        The strategy lands in each chunk's metadata: a corpus chunked several
+        ways is only debuggable if you can tell which document got which, and
+        re-chunking one source means re-ingesting it (the writes below replace
+        rather than patch).
+        """
+        cfg = self._c.settings.chunking
+        if not cfg.route_per_document:
+            return self._c.chunker.chunk(document)
+
+        chunker, strategy = route(document, self._c.chunkers, cfg.strategy)
+        chunks = chunker.chunk(document)
+        for chunk in chunks:
+            chunk.metadata["chunk_strategy"] = strategy
+        if strategy != cfg.strategy:
+            log.info("chunk_strategy_routed", source=document.source, strategy=strategy)
+        return chunks
+
     def _check_capacity(self, tenant: Tenant, incoming: int) -> None:
-        """Refuse a document that would exceed the tenant's chunk allowance.
+        """Refuse a document that would exceed the chunk allowance.
 
         Checked per document rather than once up front: a folder ingest should
         store what fits and stop at the boundary, not fail wholesale.
+
+        `count()` reports this *shelf's* chunks, not the account's, because a
+        vector store only ever sees one corpus. The caller closes that gap by
+        passing `max_chunks` already reduced by what the user's other shelves
+        hold — see `api.routers.ingest._shelf_chunk_budget`.
         """
         if not self._max_chunks:
             return
@@ -73,9 +99,13 @@ class IngestPipeline:
                 "Delete a document to free space."
             )
 
-    def run(self, path: str | Path, user_id: str | None = None) -> IngestStats:
+    def run(
+        self, path: str | Path, user_id: str | None = None, shelf: str | None = None
+    ) -> IngestStats:
+        """Ingest into one user's shelf. `shelf` is the slug; empty or None is
+        their default shelf, whose corpus is the bare tenant id."""
         c = self._c
-        tenant = c.tenant(user_id)  # resolves + prepares the user's namespace
+        tenant = c.tenant(user_id, shelf)  # resolves + prepares the namespace
         stats = IngestStats()
         extract = c.settings.ingestion.extract_graph
 
@@ -86,7 +116,7 @@ class IngestPipeline:
                 log.warning("empty_document", source=document.source)
                 continue
 
-            chunks = c.chunker.chunk(document)
+            chunks = self._chunk(document)
             if not chunks:
                 continue
 
@@ -107,6 +137,11 @@ class IngestPipeline:
                 # Vectors live elsewhere, but fulltext search and MENTIONS
                 # edges still need the chunk nodes in the graph.
                 tenant.graph_store.upsert_chunks(chunks)
+            # After both writers, because either one may have authored the
+            # nodes: the Neo4j vector store writes them when vectors live in
+            # the graph, `upsert_chunks` when they don't. Linking here is what
+            # makes the :NEXT chain exist under every vector provider.
+            tenant.graph_store.link_chunk_sequence(chunks)
 
             if extract:
                 self._build_graph(tenant, chunks, stats)
@@ -114,7 +149,10 @@ class IngestPipeline:
             stats.documents += 1
             stats.chunks += len(chunks)
             stats.files.append(document.source)
-            log.info("ingested", user=tenant.user_id, source=document.source, chunks=len(chunks))
+            log.info(
+                "ingested", user=tenant.user_id, corpus=tenant.corpus,
+                source=document.source, chunks=len(chunks),
+            )
 
         if extract and stats.documents:
             self._enrich(tenant)

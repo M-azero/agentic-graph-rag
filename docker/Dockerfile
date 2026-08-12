@@ -46,7 +46,8 @@ FROM python:3.11-slim AS runtime
 ENV PYTHONUNBUFFERED=1 \
     PATH="/opt/venv/bin:$PATH" \
     HF_HOME=/app/.cache/huggingface \
-    GRAPHRAG_CONFIG_DIR=/app/configs
+    GRAPHRAG_CONFIG_DIR=/app/configs \
+    GRAPHRAG_PROMPT_DIR=/app/prompts
 
 # gosu lets the entrypoint drop from root to the app user cleanly (the pattern
 # the official Postgres image uses).
@@ -60,6 +61,9 @@ WORKDIR /app
 COPY pyproject.toml README.md alembic.ini ./
 COPY src ./src
 COPY configs ./configs
+# The agent's job presets. Authored as Markdown and read at runtime, so they are
+# image content like configs are — not packaged inside the wheel.
+COPY prompts ./prompts
 COPY migrations ./migrations
 # The preflight check ships with the image so it can be run where it means
 # something — against the deployed config, from inside the network:
@@ -84,7 +88,9 @@ HEALTHCHECK --interval=10s --timeout=5s --retries=30 --start-period=60s \
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 
-# One worker process: the duckdb vector provider requires a single owner per
-# tenant file, and on 2 vCPUs a second worker would contend rather than help.
+# One worker process, and it stays one however many cores the box has: the
+# duckdb vector provider takes an exclusive lock per tenant file, so a second
+# uvicorn worker would not share the load — it would fail to open the database.
+# Extra cores go to ingest fan-out (ingestion.max_concurrency) instead.
 CMD ["uvicorn", "graphrag.api.app:create_app", "--factory", \
      "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

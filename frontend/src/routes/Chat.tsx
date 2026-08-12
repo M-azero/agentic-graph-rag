@@ -5,11 +5,14 @@ import { useNavigate, useParams } from "react-router-dom";
 import {
   ApiError,
   queryOnce,
+  shelves as shelvesApi,
   threads as threadsApi,
   type LimitDetail,
+  type ShelfInfo,
   type ThreadInfo,
 } from "../api";
 import { DocumentsPanel } from "../components/DocumentsPanel";
+import { ShelfPicker } from "../components/ShelfPicker";
 import { Composer } from "../components/chat/Composer";
 import { Message, type Turn } from "../components/chat/Message";
 import { QuotaBanner } from "../components/chat/QuotaBanner";
@@ -17,8 +20,8 @@ import { ThreadSidebar } from "../components/chat/ThreadSidebar";
 import { Alert, Button, EmptyState } from "../components/ui";
 import { useAuth } from "../lib/auth";
 
-const STYLE_KEY = "graphrag_style";
 const MODEL_KEY = "graphrag_model";
+const SHELF_KEY = "graphrag_shelf";
 
 export default function Chat() {
   const { me } = useAuth();
@@ -33,10 +36,21 @@ export default function Chat() {
   const [error, setError] = useState("");
   const [quota, setQuota] = useState<LimitDetail | null>(null);
   const [showDocs, setShowDocs] = useState(false);
-  const [style, setStyle] = useState(() => localStorage.getItem(STYLE_KEY) ?? "detailed");
+  const [shelves, setShelves] = useState<ShelfInfo[]>([]);
+  const [maxShelves, setMaxShelves] = useState(0);
+  const [shelfId, setShelfId] = useState<string | null>(
+    () => localStorage.getItem(SHELF_KEY) || null,
+  );
+  // The job preset. Seeded from the active shelf's default, then whatever the
+  // user last chose — a shelf's preset is a starting point, not a lock.
+  const [preset, setPreset] = useState("general");
   const [model, setModel] = useState(
     () => localStorage.getItem(MODEL_KEY) ?? me?.default_model ?? "",
   );
+
+  const presets = me?.presets ?? [];
+  const activeShelf =
+    shelves.find((s) => (s.id ?? null) === shelfId) ?? shelves[0] ?? null;
 
   const bottomRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
@@ -49,8 +63,8 @@ export default function Chat() {
   // alone.
   const streamingRef = useRef<string | null>(null);
 
-  useEffect(() => localStorage.setItem(STYLE_KEY, style), [style]);
   useEffect(() => localStorage.setItem(MODEL_KEY, model), [model]);
+  useEffect(() => localStorage.setItem(SHELF_KEY, shelfId ?? ""), [shelfId]);
 
   const loadThreads = useCallback(async () => {
     try {
@@ -62,9 +76,37 @@ export default function Chat() {
     }
   }, []);
 
+  const loadShelves = useCallback(async () => {
+    try {
+      const data = await shelvesApi.list();
+      setShelves(data.shelves);
+      setMaxShelves(data.max_shelves);
+      // A remembered shelf that no longer exists (deleted here or on another
+      // device) must not leave the picker pointing at nothing — and must not be
+      // sent to the server, which would 404 every question.
+      setShelfId((current) =>
+        data.shelves.some((s) => (s.id ?? null) === current)
+          ? current
+          : (data.shelves[0]?.id ?? null),
+      );
+    } catch {
+      // Shelves need a database. Without one the server answers from the
+      // default shelf anyway, so the chat stays fully usable — just without a
+      // picker. Nothing to report.
+    }
+  }, []);
+
   useEffect(() => {
     void loadThreads();
-  }, [loadThreads]);
+    void loadShelves();
+  }, [loadThreads, loadShelves]);
+
+  // The active shelf seeds the mode. Reading the shelf rather than localStorage
+  // is the point of a per-shelf default: opening the maths shelf should select
+  // Study without the user re-picking it every session.
+  useEffect(() => {
+    if (activeShelf) setPreset(activeShelf.preset);
+  }, [activeShelf?.id, activeShelf?.preset]);
 
   // Load a conversation's transcript when the route changes. History lives on
   // the server now, so a reload or another device shows the same thing.
@@ -99,6 +141,11 @@ export default function Chat() {
             sources: m.sources?.length ? m.sources : undefined,
           })),
         );
+        // Follow the conversation to its shelf. A thread is pinned to the shelf
+        // it was created on and the server answers from that one regardless, so
+        // leaving the picker elsewhere would show documents this conversation
+        // cannot actually reach.
+        setShelfId(data.thread.shelf_id ?? null);
       } catch {
         if (!cancelled) navigate("/chat", { replace: true });
       }
@@ -114,13 +161,42 @@ export default function Chat() {
 
   async function createThread() {
     try {
-      const thread = await threadsApi.create();
+      const thread = await threadsApi.create("New chat", shelfId);
       setThreads((prev) => [thread, ...prev]);
       navigate(`/chat/${thread.id}`);
     } catch (err) {
       if (err instanceof ApiError && err.limit) setQuota(err.limit);
       else setError(err instanceof Error ? err.message : "Could not start a conversation.");
     }
+  }
+
+  async function createShelf(name: string, newPreset: string) {
+    const shelf = await shelvesApi.create(name, newPreset);
+    await loadShelves();
+    // Switch to it, and leave any open conversation behind: the new shelf has
+    // no documents yet and the current thread belongs to a different one.
+    setShelfId(shelf.id);
+    if (threadId) navigate("/chat");
+  }
+
+  async function removeShelf(id: string) {
+    try {
+      await shelvesApi.remove(id);
+      // Its conversations went with it, so both lists are stale.
+      await Promise.all([loadShelves(), loadThreads()]);
+      if (shelfId === id) setShelfId(null);
+      if (threadId) navigate("/chat");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not delete the shelf.");
+    }
+  }
+
+  function selectShelf(id: string | null) {
+    setShelfId(id);
+    // A conversation belongs to one shelf, so switching shelves means leaving
+    // it — otherwise the picker and the thread would disagree about what the
+    // next question searches, and the thread would silently win.
+    if (threadId) navigate("/chat");
   }
 
   async function removeThread(id: string) {
@@ -150,7 +226,9 @@ export default function Chat() {
     let id = threadId;
     if (!id) {
       try {
-        const thread = await threadsApi.create();
+        // Pinned to the shelf showing in the picker. This is the only moment
+        // the client gets to choose; every later turn follows the thread.
+        const thread = await threadsApi.create("New chat", shelfId);
         setThreads((prev) => [thread, ...prev]);
         id = thread.id;
         // Mark before navigating so the load effect this navigation triggers
@@ -187,7 +265,9 @@ export default function Chat() {
       // redact) before replying, then hands back the verdict to display. The
       // answer arrives whole rather than token-by-token — the price of letting
       // the guard hold an answer back instead of only flagging it after the fact.
-      const result = await queryOnce(question, style, id, model || undefined, controller.signal);
+      const result = await queryOnce(
+        question, preset, id, model || undefined, controller.signal, shelfId,
+      );
       patchLast({
         content: result.answer,
         sources: result.sources,
@@ -226,6 +306,24 @@ export default function Chat() {
         threads={threads}
         activeId={threadId ?? null}
         loading={loadingThreads}
+        // Above the conversation list, because it scopes the whole list: a
+        // thread belongs to one shelf, and switching shelves leaves it.
+        // Omitted entirely when there are no shelves (no database), so the
+        // chat degrades to exactly what it was before.
+        header={
+          shelves.length > 0 ? (
+            <ShelfPicker
+              shelves={shelves}
+              activeId={activeShelf?.id ?? null}
+              presets={presets}
+              maxShelves={maxShelves}
+              disabled={busy}
+              onSelect={selectShelf}
+              onCreate={createShelf}
+              onDelete={removeShelf}
+            />
+          ) : undefined
+        }
         onSelect={(id) => navigate(`/chat/${id}`)}
         onCreate={createThread}
         onDelete={removeThread}
@@ -251,7 +349,9 @@ export default function Chat() {
             {turns.length === 0 && !quota && (
               <EmptyState
                 icon={<FileText className="h-6 w-6" />}
-                title="Ask your documents anything"
+                title={
+                  activeShelf ? `Ask “${activeShelf.name}” anything` : "Ask your documents anything"
+                }
                 description="Upload a file, then ask a question. Answers cite the passages they came from."
                 action={
                   <Button variant="secondary" onClick={() => setShowDocs(true)}>
@@ -275,8 +375,9 @@ export default function Chat() {
             onSend={send}
             onStop={stop}
             busy={busy}
-            style={style}
-            onStyleChange={setStyle}
+            preset={preset}
+            onPresetChange={setPreset}
+            presets={presets}
             model={model}
             onModelChange={setModel}
             models={me?.models ?? []}
@@ -284,7 +385,14 @@ export default function Chat() {
         </div>
       </section>
 
-      {showDocs && <DocumentsPanel onClose={() => setShowDocs(false)} />}
+      {showDocs && (
+        <DocumentsPanel
+          onClose={() => setShowDocs(false)}
+          shelfId={activeShelf?.id ?? null}
+          shelfName={activeShelf?.name ?? "Documents"}
+          onChanged={loadShelves}
+        />
+      )}
     </div>
   );
 }

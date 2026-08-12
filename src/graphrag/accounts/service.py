@@ -172,6 +172,15 @@ class AccountService:
     def _auth(self):
         return self._settings.auth
 
+    @property
+    def available(self) -> bool:
+        """Whether there is a database behind this service.
+
+        Read by the routers to answer 503 rather than 500, and by
+        `resolve_session` to answer "not signed in" rather than raising.
+        """
+        return self._factory is not None
+
     # -- registration ---------------------------------------------------------
     async def signup(self, email: str, password: str) -> None:
         """Create a pending account and email a verification code.
@@ -381,8 +390,15 @@ class AccountService:
         return True
 
     async def resolve_session(self, token: str) -> Principal | None:
-        """Identify the holder of a session cookie, or None."""
-        if not token:
+        """Identify the holder of a session cookie, or None.
+
+        Returns None rather than raising when there is no database. This runs on
+        every request that carries a cookie, so a deployment with accounts
+        unconfigured (or a bad DSN) would otherwise answer 500 to every returning
+        visitor instead of 401 — and a 500 does not send the UI to the sign-in
+        page, so the app looks broken rather than signed out.
+        """
+        if not token or self._factory is None:
             return None
         token_hash = _hash_token(token)
         cached = self._cache_get(token_hash)
@@ -413,7 +429,9 @@ class AccountService:
         return principal
 
     async def logout(self, token: str) -> None:
-        if not token:
+        # Same reasoning as `resolve_session`: signing out with no database is
+        # already true, so it must not raise.
+        if not token or self._factory is None:
             return
         token_hash = _hash_token(token)
         async with session_scope(self._factory) as s:
