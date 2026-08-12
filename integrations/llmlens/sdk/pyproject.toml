@@ -6,7 +6,10 @@ build-backend = "hatchling.build"
 name = "llmlens"
 version = "0.1.0"
 description = "llmlens SDK: instrument any LLM app to trace prompts, responses, latency, token cost, and tool calls."
-readme = "../README.md"
+# Must resolve INSIDE this directory. hatchling 1.32 rejects `../README.md`
+# with "Readme path must be within the project directory" even when the file is
+# there, which broke `pip install -e sdk` in CI and the API image build.
+readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
 keywords = ["llm", "observability", "tracing", "opentelemetry", "langchain", "openai", "anthropic"]

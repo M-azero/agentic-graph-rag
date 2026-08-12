@@ -34,12 +34,11 @@ admin/dist
 .mypy_cache
 # The integrations have their own build contexts (compose points straight at
 # their directories, where this file does not apply). From the root context the
-# API image needs only the llmlens SDK — plus the llmlens README, which the
-# SDK's pyproject references as its readme (`../README.md`).
+# API image needs only the llmlens SDK, which is self-contained — it carries
+# its own README, so nothing else from that directory has to ship.
 integrations/guardrails
 integrations/llmlens/*
 !integrations/llmlens/sdk
-!integrations/llmlens/README.md
 # Cache excludes LAST: the latest matching pattern wins, so placed before the
 # `!` re-inclusions above these would lose — and the sdk's __pycache__ (host
 # CPython 3.14 .pyc files, useless to the 3.11 image) would ship anyway.

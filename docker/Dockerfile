@@ -33,11 +33,11 @@ RUN pip install ".${EXTRAS}"
 # true` works out of the box; the feature stays OFF unless enabled in config.
 # Build with --build-arg WITH_LLMLENS=0 to skip it.
 ARG WITH_LLMLENS=1
-# The SDK is written to live inside the llmlens repo: its pyproject declares
-# `readme = "../README.md"`, so hatchling needs the parent README one level
-# above the package or metadata generation fails the whole install.
+# Self-contained: the SDK carries its own README, so it installs from a copied
+# directory with nothing alongside it. It used to declare
+# `readme = "../README.md"` and needed the llmlens README staged one level
+# above — hatchling 1.32 rejects that path outright, file present or not.
 COPY integrations/llmlens/sdk /tmp/llmlens-sdk
-COPY integrations/llmlens/README.md /tmp/README.md
 RUN if [ "$WITH_LLMLENS" = "1" ]; then pip install /tmp/llmlens-sdk; fi
 
 

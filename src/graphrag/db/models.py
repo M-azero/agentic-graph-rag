@@ -27,6 +27,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import INET, JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -300,6 +301,15 @@ class Shelf(Base):
 
     __table_args__ = (
         UniqueConstraint("user_id", "slug", name="uq_shelves_user_slug"),
+        # One default shelf per user. Declared here as well as in migration 0004
+        # because `alembic check` compares the models against the database: an
+        # index only the migration knows about reads as drift, and CI fails on
+        # it. Partial rather than UNIQUE(user_id, is_default), which would
+        # instead forbid a user from having two *non*-default shelves.
+        Index(
+            "uq_shelves_one_default", "user_id",
+            unique=True, postgresql_where=text("is_default"),
+        ),
     )
 
 
@@ -321,8 +331,11 @@ class Thread(Base):
     # shelf's corpus, so moving a thread would strand its history — and the
     # transcript would cite passages the new shelf does not contain. NULL means
     # the default shelf, which is what every thread predating shelves is.
+    #
+    # `index=True` yields ix_threads_shelf_id, the index migration 0004 creates.
+    # It has to be declared here too or `alembic check` reports drift.
     shelf_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("shelves.id", ondelete="SET NULL")
+        ForeignKey("shelves.id", ondelete="SET NULL"), index=True
     )
     title: Mapped[str] = mapped_column(String(120), nullable=False, default="New chat")
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -371,8 +384,11 @@ class File(Base):
     # SET NULL rather than CASCADE because deleting a shelf must not silently
     # delete the uploads, which still count against the user's file quota and
     # still exist on disk.
+    #
+    # `index=True` yields ix_files_shelf_id, the index migration 0004 creates.
+    # It has to be declared here too or `alembic check` reports drift.
     shelf_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("shelves.id", ondelete="SET NULL")
+        ForeignKey("shelves.id", ondelete="SET NULL"), index=True
     )
     name: Mapped[str] = mapped_column(Text, nullable=False)
     path: Mapped[str] = mapped_column(Text, nullable=False)
