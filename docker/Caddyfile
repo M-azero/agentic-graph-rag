@@ -8,6 +8,10 @@
 # One origin serves three things: the chat app at /, the admin console at
 # /admin, and the API at /api. Same-origin means no CORS, and it means the
 # session cookie works for both apps without being widened to a domain scope.
+#
+# ONE origin, not two. If a second hostname should reach this deployment, point
+# it at REDIRECT_FROM (bottom of this file) so it redirects — do not add it to
+# SITE_ADDRESS. See the note down there for why serving both is a bug.
 {
 	# Quoted so an unset TLS_EMAIL renders as an empty argument rather than a
 	# bare `email`, which Caddy rejects at parse time. Only used when
@@ -139,4 +143,33 @@
 		root * /srv/app
 		import spa
 	}
+}
+
+# The non-canonical hostname, redirected. Optional: set REDIRECT_FROM to the
+# name that should send visitors to SITE_ADDRESS — typically the apex when the
+# site lives at www, or www when it lives at the apex.
+#
+# Serving the app on BOTH names instead is the trap, and it looks like it works.
+# The session cookie is set with no Domain attribute (`_set_session_cookie` in
+# api/routers/auth.py), so it is host-only: a user who signs in at
+# www.example.com and later types example.com arrives signed out, holding a
+# perfectly valid session the browser will not send. Nothing errors, and the
+# fix is not discoverable from either end. One origin, one cookie.
+#
+# 308, not 301: it preserves the method and body, so a POST that lands on the
+# wrong hostname is not silently downgraded to a GET.
+#
+# The default is a scheme-prefixed loopback address on purpose. `http://` turns
+# OFF automatic HTTPS for this block, so a deployment that never sets
+# REDIRECT_FROM does not send Caddy chasing a Let's Encrypt certificate for a
+# name that does not resolve — which would retry and log errors forever. The
+# same default is repeated in docker-compose.yml, because compose always sets
+# the key and an EMPTY value here would render an empty site address and fail
+# the parse. When REDIRECT_FROM is used, SITE_ADDRESS must be a single hostname.
+{$REDIRECT_FROM:http://localhost:2020} {
+	# A redirect is still a response, and the apex has to carry HSTS itself for
+	# the `preload` claimed above to be true of the registered domain.
+	header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload"
+	header -Server
+	redir https://{$SITE_ADDRESS}{uri} 308
 }

@@ -215,6 +215,13 @@ services:
     environment:
       SITE_ADDRESS: ${SITE_ADDRESS:-:80}   # -> localhost or a domain to enable HTTPS
       TLS_EMAIL: ${TLS_EMAIL:-}
+      # A second hostname that should 308 to SITE_ADDRESS (e.g. the apex when
+      # the site lives at www). The default is NOT empty on purpose: this
+      # service has no env_file, so compose always sets the key, and an empty
+      # value would render an empty site address in the Caddyfile and fail the
+      # parse. `http://` also keeps automatic HTTPS off for the unused block.
+      # Must match the default in docker/Caddyfile.
+      REDIRECT_FROM: ${REDIRECT_FROM:-http://localhost:2020}
       # Caddy refuses bodies above this before they reach the API. Keep it
       # strictly ABOVE api.max_upload_mb in configs/*.yaml — this bounds the
       # whole multipart body, the API bounds the file inside it, so equal
