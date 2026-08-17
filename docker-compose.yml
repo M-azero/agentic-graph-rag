@@ -210,7 +210,13 @@ services:
   # It is built rather than pulled because the image carries the built SPAs:
   # `docker compose up -d --build proxy` after a UI change.
   proxy:
-    build: { context: ., dockerfile: docker/Dockerfile.proxy }
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.proxy
+      args:
+        # Baked into the two SPA bundles at build time, so changing it needs
+        # `up -d --build proxy` — a recreate cannot change a built file.
+        APP_NAME: ${APP_NAME:-Graph RAG}
     restart: unless-stopped
     environment:
       SITE_ADDRESS: ${SITE_ADDRESS:-:80}   # -> localhost or a domain to enable HTTPS

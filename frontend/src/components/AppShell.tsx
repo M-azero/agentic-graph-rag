@@ -86,7 +86,7 @@ export function AppShell({ children }: { children: ReactNode }) {
             <Network className="h-3.5 w-3.5" />
           </span>
           <span className="hidden text-base font-semibold tracking-tight text-strong sm:block">
-            Graph RAG
+            {__APP_NAME__}
           </span>
         </Link>
 

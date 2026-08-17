@@ -22,7 +22,7 @@ export function AuthLayout({
             <Network className="h-4 w-4" />
           </span>
           <span className="text-base font-semibold tracking-tight text-strong">
-            Graph RAG
+            {__APP_NAME__}
           </span>
         </div>
 

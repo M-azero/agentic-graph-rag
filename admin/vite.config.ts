@@ -6,9 +6,20 @@ import { defineConfig } from "vite";
 // and resolves against the chat app's root, which serves the wrong bundle.
 //
 // Port 5174 so `npm run dev` here and in ../frontend can run side by side.
+// Same product name the chat app uses — see frontend/vite.config.ts for why it
+// comes from the environment rather than tracked source.
+const APP_NAME = process.env.VITE_APP_NAME || "Graph RAG";
+
 export default defineConfig({
   base: "/admin/",
-  plugins: [react()],
+  plugins: [
+    react(),
+    {
+      name: "app-name-html",
+      transformIndexHtml: (html) => html.replace(/%APP_NAME%/g, APP_NAME),
+    },
+  ],
+  define: { __APP_NAME__: JSON.stringify(APP_NAME) },
   server: {
     port: 5174,
     proxy: {
