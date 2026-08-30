@@ -36,11 +36,11 @@ not a fixed pipeline, it *reasons about how to retrieve*.
 
 ```
 file ──▶ load ──▶ chunk ──▶ embed ──▶ vector index
-   (PDF/Word/    │                        │
-    HTML/CSV/    └──▶ LLM extracts ──▶ knowledge graph ──▶ resolve duplicates
-    text/image)       entities +       (entities linked to      + summarize
-                      relationships     the chunks that           communities
-                                        mention them)
+ (PDF/Word/Slides │                        │
+  Excel/CSV/JSON  └──▶ LLM extracts ──▶ knowledge graph ──▶ resolve duplicates
+  HTML/text/image)     entities +       (entities linked to      + summarize
+                      relationships      the chunks that           communities
+                                         mention them)
 ```
 
 Images and scanned PDFs are read by a small vision model (**OCR**) before

@@ -164,10 +164,27 @@ class IngestStatus(BaseModel):
 
 
 class StoredFile(BaseModel):
+    """One stored document, and how its ingest ended.
+
+    `status`, `chunks` and `job_id` are the durable answer to "did this work?".
+    They were recorded on the row from the start and simply never returned, so
+    the only place an upload's outcome existed was the panel's in-memory job
+    list — which dies when the panel closes, the shelf changes or the page
+    reloads, leaving a document that looks identical whether it ingested,
+    failed, or is still running.
+
+    `job_id` doubles as the trace id (an ingest is traced under its job id), so
+    it is also what lets the UI open the run in the pipeline inspector.
+    """
+
     file_id: str
     name: str
     source: str
     shelf_id: str | None = None
+    # uploaded (still ingesting) | ingested | error
+    status: str = "uploaded"
+    chunks: int = 0
+    job_id: str | None = None
 
 
 class FileList(BaseModel):

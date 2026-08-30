@@ -1,6 +1,7 @@
 import clsx from "clsx";
-import { FileText, Trash2, Upload as UploadIcon, X } from "lucide-react";
+import { Activity, FileText, Trash2, TriangleAlert, Upload as UploadIcon, X } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { Link } from "react-router-dom";
 
 import { ApiError, deleteFile, ingestStatus, listFiles, uploadFile, type StoredFile } from "../api";
 import { Alert, Badge, Button, EmptyState, Spinner } from "./ui";
@@ -8,7 +9,24 @@ import { QuotaBanner } from "./chat/QuotaBanner";
 import type { LimitDetail } from "../api";
 
 const POLL_MS = 1500;
-const ACCEPT = ".pdf,.docx,.txt,.md,.html,.csv,.png,.jpg,.jpeg";
+// ~3 minutes. Past that a document still reading "uploaded" is not slow,
+// it is a job that died with the process that owned it — and polling for it
+// forever is the needless-request problem, not a fix for it.
+const MAX_STALE_POLLS = 120;
+// Mirrors the loader registry in `graphrag/ingestion/loaders/__init__.py`.
+// This list only filters the file picker — the server decides for real, and
+// returns 415 for anything no loader claims. Keep them in step: a picker that
+// is narrower than the backend hides working formats, and one that is wider
+// invites a rejected upload.
+const ACCEPT = [
+  ".pdf",
+  ".docx", ".pptx",
+  ".txt", ".md", ".markdown", ".rst",
+  ".html", ".htm",
+  ".csv", ".tsv", ".xlsx", ".xlsm",
+  ".json", ".jsonl", ".ndjson",
+  ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tiff",
+].join(",");
 
 interface Job {
   id: string;
@@ -68,6 +86,28 @@ export function DocumentsPanel({
     setError("");
     void refresh();
   }, [refresh]);
+
+  // A document the server is still ingesting, where this browser holds no job
+  // entry for it — reopened panel, reloaded page, second tab, another device.
+  // Without this the row sits on "processing…" until something else happens to
+  // refresh the list, which is the same dead end as showing nothing at all.
+  //
+  // Bounded, because "uploaded" is not always transient: an ingest killed by a
+  // restart leaves the row that way permanently, and an unbounded timer would
+  // then poll this endpoint every 1.5s for as long as the panel stays open.
+  const stalePolls = useRef(0);
+  useEffect(() => {
+    if (!files.some((f) => f.status === "uploaded")) {
+      stalePolls.current = 0;
+      return;
+    }
+    if (stalePolls.current >= MAX_STALE_POLLS) return;
+    const timer = setInterval(() => {
+      stalePolls.current += 1;
+      void refresh();
+    }, POLL_MS);
+    return () => clearInterval(timer);
+  }, [files, refresh]);
 
   // Poll only while something is actually in flight, and stop as soon as
   // nothing is — a permanent timer is a needless request every 1.5s forever.
@@ -270,10 +310,46 @@ export function DocumentsPanel({
           <ul className="space-y-0.5">
             {files.map((file) => (
               <li key={file.file_id} className="group flex items-center gap-2 rounded-md px-1 py-1.5">
-                <FileText className="h-3.5 w-3.5 shrink-0 text-muted" />
-                <span className="min-w-0 flex-1 truncate text-xs text-body" title={file.name}>
+                {/* The durable outcome, read from the row rather than the job
+                    list above — that list is component state and is gone as
+                    soon as this panel closes, so without this a document looks
+                    identical whether it ingested, failed, or is still running. */}
+                {file.status === "uploaded" ? (
+                  <Spinner className="h-3.5 w-3.5 shrink-0 text-muted" />
+                ) : file.status === "error" ? (
+                  <TriangleAlert className="h-3.5 w-3.5 shrink-0 text-danger" />
+                ) : (
+                  <FileText className="h-3.5 w-3.5 shrink-0 text-muted" />
+                )}
+                <span
+                  className={clsx(
+                    "min-w-0 flex-1 truncate text-xs",
+                    file.status === "error" ? "text-muted line-through" : "text-body",
+                  )}
+                  title={file.name}
+                >
                   {file.name}
                 </span>
+                {file.status === "uploaded" ? (
+                  <span className="shrink-0 text-2xs text-muted">processing…</span>
+                ) : file.status === "error" ? (
+                  <span className="shrink-0 text-2xs text-danger">failed</span>
+                ) : file.chunks ? (
+                  <span className="shrink-0 text-2xs text-muted">{file.chunks} chunks</span>
+                ) : null}
+                {/* An ingest is traced under its job id, so this is the run —
+                    the only way to reach it after the upload's own job entry
+                    has gone. */}
+                {file.job_id && file.status !== "uploaded" && (
+                  <Link
+                    to={`/pipeline?run=${encodeURIComponent(file.job_id)}`}
+                    aria-label={`Inspect the ingest run for ${file.name}`}
+                    title="Inspect this run in the pipeline inspector"
+                    className="rounded p-1 text-muted opacity-0 transition-opacity hover:text-accent focus-visible:opacity-100 group-hover:opacity-100"
+                  >
+                    <Activity className="h-3 w-3" />
+                  </Link>
+                )}
                 <button
                   onClick={() => remove(file.file_id)}
                   aria-label={`Delete ${file.name}`}

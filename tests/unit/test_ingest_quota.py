@@ -177,6 +177,139 @@ def test_the_worker_accepts_what_the_api_sends():
     assert params["file_id"].default is None
 
 
+def test_an_unsupported_upload_is_refused_before_it_costs_anything(client, monkeypatch):
+    """415 at the request, not a failed job a minute later.
+
+    No loader claims `.zip`, so this ingest fails either way. The question is
+    where: accepting it means a 200, a reserved file slot, the caller's storage
+    allowance spent and the bytes on disk, with the real answer arriving later
+    in the job's `detail` — after the UI has already said the upload worked.
+    """
+    reserved: list = []
+
+    async def _reserve(*args, **kwargs):
+        reserved.append(args)
+        return None
+
+    monkeypatch.setattr(ingest_router, "_reserve_file_slot", _reserve)
+
+    response = client.post(
+        "/ingest/upload",
+        files={"file": ("payload.zip", b"PKnope", "application/zip")},
+        headers=_headers(),
+    )
+    assert response.status_code == 415
+    assert ".pdf" in response.json()["detail"]  # tells the caller what would work
+    assert reserved == []  # no slot taken, so nothing to release
+
+
+def test_a_supported_upload_still_gets_through_the_type_gate(client, monkeypatch):
+    """The positive control: the gate must not be the thing that breaks upload."""
+    seen: dict = {}
+
+    async def _budget(*_args, **_kwargs):
+        return 20_000
+
+    async def _reserve(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(ingest_router, "_shelf_chunk_budget", _budget)
+    monkeypatch.setattr(ingest_router, "_reserve_file_slot", _reserve)
+    monkeypatch.setattr(ingest_router, "_enqueue", _capture_enqueue(seen))
+
+    response = client.post(
+        "/ingest/upload",
+        files={"file": ("notes.md", b"# Notes", "text/markdown")},
+        headers=_headers(),
+    )
+    assert response.status_code == 200
+    assert seen["path"].endswith("notes.md")
+
+
+def test_the_type_gate_reads_the_loader_registry(client, monkeypatch):
+    """A format added to `build_loaders` must be uploadable with no second edit.
+
+    The gate used to be the kind of thing that gets written out as a literal
+    list next to the handler; that list is stale the first time a loader lands.
+    """
+    from graphrag.ingestion.loaders import supported_suffixes
+
+    async def _budget(*_args, **_kwargs):
+        return 20_000
+
+    async def _reserve(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(ingest_router, "_shelf_chunk_budget", _budget)
+    monkeypatch.setattr(ingest_router, "_reserve_file_slot", _reserve)
+    monkeypatch.setattr(ingest_router, "_enqueue", _capture_enqueue({}))
+
+    assert ".xlsx" in supported_suffixes()
+    response = client.post(
+        "/ingest/upload",
+        files={"file": ("book.xlsx", b"stub", "application/octet-stream")},
+        headers=_headers(),
+    )
+    assert response.status_code == 200
+
+
+def test_an_unsupported_url_is_refused_without_fetching_it(client, monkeypatch):
+    """The same 415 as an upload, and before the outbound request.
+
+    The URL path already refuses a caller who is out of chunk budget before it
+    fetches, on the grounds that they should not cost this server an outbound
+    request. A URL naming a file type nothing can read is the same case: the
+    ingest cannot succeed, so the download, the disk write and the file slot
+    are all spent on a job that exists only to fail.
+    """
+    fetched: list = []
+
+    def _fake_fetch(url: str, max_bytes: int):
+        fetched.append(url)
+        raise AssertionError("should have been refused before the fetch")
+
+    monkeypatch.setattr(ingest_router, "_fetch_url", _fake_fetch)
+
+    response = client.post(
+        "/ingest", params={"path": "https://example.com/archive.zip"}, headers=_headers()
+    )
+    assert response.status_code == 415
+    assert fetched == []  # no outbound request made on the caller's behalf
+
+
+def test_an_extensionless_url_is_still_allowed_through(client, downloaded, monkeypatch):
+    """`_fetch_url` names those from the response's content type, so refusing
+    them up front would break the ordinary `https://example.com/article` case."""
+    async def _reserve(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(ingest_router, "_reserve_file_slot", _reserve)
+    monkeypatch.setattr(ingest_router, "_enqueue", _capture_enqueue({}))
+
+    response = client.post(
+        "/ingest", params={"path": "https://example.com/article"}, headers=_headers()
+    )
+    assert response.status_code == 200
+
+
+def test_a_fetch_that_lands_on_an_unsupported_name_is_cleaned_up(client, monkeypatch, tmp_path):
+    """The post-fetch guard: `_URL_SUFFIX` must not be able to introduce a
+    suffix no loader claims. We downloaded the bytes, so we delete them."""
+    def _fake_fetch(url: str, max_bytes: int):
+        dest = Path("data/downloads") / "abcd1234_thing.bin"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"payload")
+        return dest, "thing.bin"
+
+    monkeypatch.setattr(ingest_router, "_fetch_url", _fake_fetch)
+
+    response = client.post(
+        "/ingest", params={"path": "https://example.com/thing"}, headers=_headers()
+    )
+    assert response.status_code == 415
+    assert list((tmp_path / "data" / "downloads").iterdir()) == []
+
+
 def _capture_enqueue(sink: dict):
     async def _enqueue(request, background, container, store, path, user_id, **kwargs):
         sink.update(kwargs, path=path, user_id=user_id)
@@ -185,3 +318,44 @@ def _capture_enqueue(sink: dict):
         return IngestResponse(job_id="test", status="queued")
 
     return _enqueue
+
+
+def test_the_file_list_reports_how_each_ingest_ended(client, monkeypatch):
+    """The durable answer to "did this work?" has to reach the browser.
+
+    `files.status`, `.chunks` and `.job_id` were recorded on the row from the
+    start and never returned, so the only carrier of an upload's outcome was
+    the panel's in-memory job list — gone the moment the panel closes, the
+    shelf changes or the page reloads. A document then looks identical whether
+    it ingested, failed, or is still running.
+    """
+    from graphrag.api.schemas import StoredFile
+
+    fields = StoredFile.model_fields
+    assert {"status", "chunks", "job_id"} <= set(fields)
+    # "uploaded" is the row's own default: written before the work starts, so a
+    # file that has not finished must not read as a successful one.
+    assert fields["status"].default == "uploaded"
+
+
+def test_a_file_is_linked_to_its_job_when_the_job_is_created(client, downloaded, monkeypatch):
+    """Linked at creation, not completion — the link is most useful while the
+    ingest is still running, and it is what points a finished document at its
+    run in the inspector (an ingest is traced under its job id)."""
+    linked: dict = {}
+
+    async def _link(db, file_id, job_id):
+        linked.update(file_id=file_id, job_id=job_id)
+
+    async def _reserve(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(ingest_router, "link_file_to_job", _link)
+    monkeypatch.setattr(ingest_router, "_reserve_file_slot", _reserve)
+
+    response = client.post(
+        "/ingest", params={"path": "https://example.com/doc.md"}, headers=_headers()
+    )
+    assert response.status_code == 200
+    assert linked["job_id"] == response.json()["job_id"]
+    assert linked["file_id"]

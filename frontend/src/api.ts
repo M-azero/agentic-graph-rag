@@ -29,6 +29,16 @@ export interface StoredFile {
   name: string;
   source: string;
   shelf_id: string | null;
+  /** "uploaded" means the ingest has not finished yet — the row is written
+   *  before the work starts. This is the durable answer to "did it work?":
+   *  the upload job list lives only in component memory, so it is gone the
+   *  moment the panel closes or the page reloads. */
+  status: "uploaded" | "ingested" | "error";
+  chunks: number;
+  /** Also the trace id — an ingest is traced under its job id, so this is what
+   *  opens the run in the pipeline inspector. Null for files ingested before
+   *  the link was recorded. */
+  job_id: string | null;
 }
 
 export interface FileList {

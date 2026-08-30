@@ -64,6 +64,8 @@ dependencies = [
   "pillow>=10.4",
   "pytesseract>=0.3.13",
   "python-docx>=1.1",
+  "python-pptx>=1.0",     # .pptx decks
+  "openpyxl>=3.1",        # .xlsx workbooks (pure python, no torch, no C ext)
   "beautifulsoup4>=4.12",
   "numpy>=1.26",
 ]

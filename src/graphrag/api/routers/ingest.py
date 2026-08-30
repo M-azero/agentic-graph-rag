@@ -39,7 +39,8 @@ from graphrag.core.net import BlockedURLError, open_public_url
 from graphrag.core.redact import safe_detail
 from graphrag.db.engine import session_scope
 from graphrag.db.models import File
-from graphrag.ingestion.status import finalize_file
+from graphrag.ingestion.loaders import supported_suffixes
+from graphrag.ingestion.status import finalize_file, link_file_to_job
 from graphrag.jobs import JobStatus, JobStore
 from graphrag.limits import effective_limits, reject_with
 from graphrag.limits.service import LimitBreach, Limits
@@ -64,6 +65,10 @@ _URL_SUFFIX = {
     "text/markdown": ".md",
     "text/plain": ".txt",
     "text/csv": ".csv",
+    "application/json": ".json",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
 }
 
 
@@ -77,6 +82,7 @@ _INGEST_SLOT = asyncio.Semaphore(1)
 def _inproc_ingest(
     container: Container, store: JobStore, job_id: str, path: str, user_id,
     max_chunks: int | None = None, shelf: str | None = None, trace_store=None,
+    display_name: str | None = None,
 ) -> None:
     """Run the pipeline and record the outcome. Blocking — call it off the loop."""
     store.set(JobStatus(job_id, status="running", owner=user_id))
@@ -89,6 +95,7 @@ def _inproc_ingest(
             job_id=job_id,
             settings=container.settings,
             trace_store=trace_store,
+            title=display_name,
         )
         # "partial" when the text is searchable but the knowledge graph is not:
         # extraction failed for at least one chunk. Reporting that as "done"
@@ -124,13 +131,13 @@ async def _run_ingest(
     container: Container, store: JobStore, job_id: str, path: str, user_id,
     max_chunks: int | None = None, db=None, file_id: str | None = None,
     recorder=None, account_id: str | None = None, shelf: str | None = None,
-    trace_store=None,
+    trace_store=None, display_name: str | None = None,
 ):
     """One queued ingest, off the event loop so streaming stays responsive."""
     async with _INGEST_SLOT:
         await asyncio.to_thread(
             _inproc_ingest, container, store, job_id, path, user_id, max_chunks,
-            shelf, trace_store,
+            shelf, trace_store, display_name,
         )
     status = store.get(job_id)
     await finalize_file(db, file_id, status)
@@ -156,9 +163,14 @@ async def _enqueue(
     store: JobStore, path: str, user_id,
     max_chunks: int | None = None, db=None, file_id: str | None = None,
     account_id: str | None = None, shelf: str | None = None,
+    display_name: str | None = None,
 ) -> IngestResponse:
     job_id = uuid.uuid4().hex[:12]
     store.set(JobStatus(job_id, status="queued", owner=user_id))
+    # Stamped now, not at the end: a document is most in need of a status while
+    # it is still ingesting, and the row is the only carrier that survives the
+    # panel being closed or the page reloaded.
+    await link_file_to_job(db, file_id, job_id)
     arq = getattr(request.app.state, "arq", None)
     recorder = getattr(request.app.state, "usage", None)
     if arq is not None:
@@ -174,7 +186,7 @@ async def _enqueue(
         background.add_task(
             _run_ingest, container, store, job_id, path, user_id, max_chunks, db,
             file_id, recorder, account_id, shelf,
-            getattr(request.app.state, "trace_store", None),
+            getattr(request.app.state, "trace_store", None), display_name,
         )
     return IngestResponse(job_id=job_id, status="queued")
 
@@ -278,6 +290,9 @@ async def ingest_upload(
 
     file_id = uuid.uuid4().hex[:8]
     name = Path(file.filename or "upload").name
+
+    _reject_unsupported(name)
+
     dest = _UPLOAD_DIR / (file_id + "_" + name)
 
     # Before the slot is reserved and the bytes hit the disk, so an over-quota
@@ -303,7 +318,7 @@ async def ingest_upload(
     return await _enqueue(
         request, background, container, store, str(dest), user_key,
         max_chunks=budget, db=db, file_id=file_id,
-        account_id=user.user_id, shelf=shelf.slug,
+        account_id=user.user_id, shelf=shelf.slug, display_name=name,
     )
 
 
@@ -374,6 +389,7 @@ async def list_files(
         StoredFile(
             file_id=f.id, name=f.name, source=f.path,
             shelf_id=str(f.shelf_id) if f.shelf_id else None,
+            status=f.status, chunks=f.chunks, job_id=f.job_id,
         )
         for f in rows
     ]
@@ -418,6 +434,36 @@ async def delete_file(
         "file_deleted", user=user_key, file=file_id, shelf=shelf.slug, chunks=removed
     )
     return DeleteResponse(file_id=file_id, chunks_removed=removed)
+
+
+def _reject_unsupported(name: str, *, allow_missing: bool = False) -> None:
+    """415 unless some loader claims this filename's extension.
+
+    Refused at the request rather than inside the job. The ingest is going to
+    fail either way — but failing it there means the caller first gets a 200,
+    a file slot and their storage allowance are spent, the bytes are written,
+    and the real answer arrives a minute later in the job's `detail`, after the
+    UI has already said the upload worked.
+
+    Read from the loader registry rather than a list written out here, so a new
+    loader widens this for free; a second copy of the list is a copy that goes
+    stale the first time one lands.
+
+    `allow_missing` is for the URL path *before* the fetch, where an extension-
+    less URL is legitimate — `_fetch_url` names it from the response's content
+    type, so that case is checked again once the name is known.
+    """
+    suffix = Path(name).suffix.lower()
+    if not suffix and allow_missing:
+        return
+    if suffix not in supported_suffixes():
+        raise HTTPException(
+            status_code=415,
+            detail=(
+                f"Unsupported file type '{suffix or name}'. Supported: "
+                + ", ".join(sorted(supported_suffixes()))
+            ),
+        )
 
 
 def _fetch_url(url: str, max_bytes: int) -> tuple[Path, str]:
@@ -514,10 +560,22 @@ async def ingest_path(
         # The smaller of the server ceiling and the caller's own allowance,
         # matching /ingest/upload — a URL must not be the cheap way past it.
         per_file_mb = min(container.settings.api.max_upload_mb, limits.max_file_mb)
-        # Checked before the fetch: a user with no chunk budget left should not
-        # cause this server to make an outbound request on their behalf.
+        # Both checked before the fetch, for the same reason: neither a user
+        # who is out of chunk budget nor one who asked for a file type nothing
+        # can read should cause this server to make an outbound request on
+        # their behalf. A URL carrying no extension passes here and is checked
+        # below instead, once the content type has named it.
+        _reject_unsupported(Path(urllib.parse.urlparse(path).path).name, allow_missing=True)
         budget = await _shelf_chunk_budget(db, user, limits, shelf)
         dest, name = _fetch_url(path, per_file_mb * 1024 * 1024)
+        # Again on the name the fetch settled on, so `_URL_SUFFIX` cannot hand
+        # back a suffix no loader claims. We downloaded it, so cleaning it up
+        # is ours — same contract as the quota rejection below.
+        try:
+            _reject_unsupported(name)
+        except HTTPException:
+            dest.unlink(missing_ok=True)
+            raise
 
         file_id = uuid.uuid4().hex[:8]
         breach = await _reserve_file_slot(
@@ -529,7 +587,7 @@ async def ingest_path(
         return await _enqueue(
             request, background, container, store, str(dest), user.tenant_id,
             max_chunks=budget, db=db, file_id=file_id,
-            account_id=user.user_id, shelf=shelf.slug,
+            account_id=user.user_id, shelf=shelf.slug, display_name=name,
         )
 
     # Admin only, and checked before the path is even resolved so a non-admin

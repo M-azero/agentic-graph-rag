@@ -31,6 +31,7 @@ def run_traced(
     job_id: str,
     settings: Any,
     trace_store: TraceStore | None,
+    title: str | None = None,
 ) -> Any:
     """`pipeline.run(path, user_id, shelf)`, traced. Blocking — call it off the
     event loop, exactly as the untraced call already is."""
@@ -52,12 +53,12 @@ def run_traced(
     except Exception:
         # A failed ingest is exactly when the trace is worth having: it shows
         # which block stopped and what it had at the time.
-        tracer.finalize(status=ERROR, title=_title(path))
+        tracer.finalize(status=ERROR, title=title or _title(path))
         _persist(tracer, trace_store)
         raise
     tracer.finalize(
         status=OK,
-        title=_title(path),
+        title=title or _title(path),
         documents=stats.documents,
         chunks=stats.chunks,
         entities=stats.entities,
@@ -69,6 +70,8 @@ def run_traced(
 
 
 def _title(path: str) -> str:
+    """Fallback for a caller with no display name — the server-side path ingest,
+    where the on-disk name *is* the name the operator asked for."""
     return str(path).replace("\\", "/").rsplit("/", 1)[-1] or str(path)
 
 

@@ -20,6 +20,28 @@ log = get_logger(__name__)
 _SEARCHABLE = ("done", "partial")
 
 
+async def link_file_to_job(db, file_id: str | None, job_id: str) -> None:
+    """Record which ingest job owns this file. Never raises.
+
+    Written when the job is created rather than when it ends, because the link
+    is most useful while the ingest is still running — it is what lets the UI
+    poll a document it did not just upload in this browser tab, and what points
+    a finished document at its run in the pipeline inspector (an ingest is
+    traced under its job id).
+    """
+    if db is None or not file_id:
+        return
+    from sqlalchemy import update as sql_update
+
+    try:
+        async with session_scope(db) as s:
+            await s.execute(
+                sql_update(File).where(File.id == file_id).values(job_id=job_id)
+            )
+    except Exception as exc:
+        log.warning("file_job_link_failed", file=file_id, error=str(exc))
+
+
 async def finalize_file(db, file_id: str | None, status) -> None:
     """Stamp the terminal ingest state on a file row. Never raises."""
     if db is None or not file_id or status is None:

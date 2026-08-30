@@ -7,6 +7,7 @@
 
 import { Play, RotateCcw, Square } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 
 import {
   ApiError,
@@ -123,7 +124,7 @@ export default function Pipeline() {
     abortRef.current?.abort();
   }
 
-  async function open(id: string) {
+  const open = useCallback(async (id: string) => {
     setError("");
     setSteps([]);
     setAnswer(null);
@@ -134,7 +135,16 @@ export default function Pipeline() {
     } catch {
       setError("That run has expired or is no longer available.");
     }
-  }
+  }, []);
+
+  // Deep link from a document in Chat: `/pipeline?run=<job id>`. An ingest is
+  // traced under its job id and runs in a background task — it can never be
+  // streamed here, so opening it by id is the only way in.
+  const [params] = useSearchParams();
+  const runParam = params.get("run");
+  useEffect(() => {
+    if (runParam) void open(runParam);
+  }, [runParam, open]);
 
   return (
     <div className="mx-auto flex h-full max-w-[1400px] flex-col gap-4 overflow-y-auto p-4">
