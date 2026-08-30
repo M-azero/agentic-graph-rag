@@ -21,6 +21,8 @@ from graphrag.core.logging import get_logger
 from graphrag.core.messages import content_to_text as _text
 from graphrag.core.types import QueryResult, RetrievedChunk
 from graphrag.retrieval.plan import RetrievalPlan, use_plan
+from graphrag.trace import step
+from graphrag.trace import steps as trace_steps
 from graphrag.usage.meter import use_meter
 
 log = get_logger(__name__)
@@ -281,15 +283,45 @@ class AgentSession:
             input_tokens=tokens_in, output_tokens=tokens_out,
         )
 
+    def _question(self) -> str:
+        return _text(self._input["messages"][0].content)
+
+    def _traced(self, step_handle, result: QueryResult) -> QueryResult:
+        """Record what the loop did, on the way out.
+
+        The ordered tool decisions live here rather than as steps of their own:
+        choosing a tool is a field on a message, not work with a start and an
+        end, and the calls it leads to are already timed individually.
+        """
+        step_handle.output(
+            answer=result.answer,
+            tools=[tc["tool"] for tc in result.tool_calls],
+            tool_calls=result.tool_calls,
+            sources=len(result.sources),
+            labels=result.source_labels,
+        )
+        step_handle.meta(
+            input_tokens=result.input_tokens, output_tokens=result.output_tokens
+        )
+        return result
+
     def run(self) -> QueryResult:
         """Blocking run — CLI and scripts. Needs a sync-capable checkpointer."""
-        with self._collecting():
-            return self._shape(self._agent.invoke(self._input, self._config))
+        with self._collecting(), step(
+            trace_steps.AGENT_RUN, question=self._question()
+        ) as s:
+            return self._traced(
+                s, self._shape(self._agent.invoke(self._input, self._config))
+            )
 
     async def arun(self) -> QueryResult:
         """Async run — the API's non-streaming path."""
-        with self._collecting():
-            return self._shape(await self._agent.ainvoke(self._input, self._config))
+        with self._collecting(), step(
+            trace_steps.AGENT_RUN, question=self._question()
+        ) as s:
+            return self._traced(
+                s, self._shape(await self._agent.ainvoke(self._input, self._config))
+            )
 
     async def astream_events(self) -> AsyncIterator[tuple[str, str]]:
         """Yield ("tool", name) when the model starts a tool call and
@@ -298,7 +330,10 @@ class AgentSession:
         line, so streamed and non-streamed outputs read the same."""
         emitted_text = False
         boundary_pending = False
-        with self._collecting():
+        tools_chosen: list[str] = []
+        with self._collecting(), step(
+            trace_steps.AGENT_RUN, question=self._question()
+        ) as traced:
             async for msg, _meta in self._agent.astream(
                 self._input, self._config, stream_mode="messages"
             ):
@@ -309,6 +344,7 @@ class AgentSession:
                 if isinstance(msg, AIMessageChunk):
                     for tc in msg.tool_call_chunks or []:
                         if tc.get("name"):
+                            tools_chosen.append(tc["name"])
                             yield "tool", tc["name"]
                     text = _text(msg.content)
                     if text:
@@ -317,6 +353,7 @@ class AgentSession:
                             boundary_pending = False
                         emitted_text = True
                         yield "token", text
+            traced.output(tools=tools_chosen, sources=len(self.sources))
 
 
 class AgentRunner:

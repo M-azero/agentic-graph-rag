@@ -101,6 +101,21 @@ class SearchResponse(BaseModel):
     results: list[Source] = []
 
 
+class TraceRunRequest(BaseModel):
+    """One question to run with the pipeline inspector watching.
+
+    A subset of `QueryRequest`: no `thread_id` (a traced run uses a throwaway
+    one so it cannot land in a conversation) and no `stream` (steps always
+    stream, the answer never does).
+    """
+
+    question: str = Field(..., min_length=1, max_length=_MAX_QUESTION_CHARS)
+    style: str = Field("detailed", description="concise | detailed | technical | eli5")
+    preset: str | None = Field(None, max_length=_MAX_PRESET_ID_CHARS)
+    shelf_id: str | None = Field(None, max_length=_MAX_ID_CHARS)
+    model: str | None = Field(None, max_length=_MAX_MODEL_ID_CHARS)
+
+
 class CompareRequest(BaseModel):
     """A side-by-side comparison.
 

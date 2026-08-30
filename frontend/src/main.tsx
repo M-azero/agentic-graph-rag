@@ -17,6 +17,9 @@ import Verify from "./routes/Verify";
 // first page an unauthenticated visitor sees is not the heaviest one.
 const Chat = lazy(() => import("./routes/Chat"));
 const Account = lazy(() => import("./routes/Account"));
+// Split for the same reason Chat is: the inspector carries the diagram and
+// nothing about signing in needs it.
+const Pipeline = lazy(() => import("./routes/Pipeline"));
 
 function Loading() {
   return (
@@ -53,6 +56,7 @@ const router = createBrowserRouter([
   // back button and a shared link both work.
   { path: "/chat/:threadId", element: app(<Chat />) },
   { path: "/account", element: app(<Account />) },
+  { path: "/pipeline", element: app(<Pipeline />) },
 
   { path: "*", element: <Navigate to="/chat" replace /> },
 ]);

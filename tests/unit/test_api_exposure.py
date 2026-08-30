@@ -173,3 +173,17 @@ def test_production_does_not_enable_observability(production):
 
 def test_production_keeps_the_relevance_gate_on(production):
     assert production.retrieval.min_relevance > 0
+
+
+@pytest.mark.parametrize(
+    "path", ["/trace/pipelines", "/trace/runs", "/trace/some-id"]
+)
+def test_trace_endpoints_need_a_caller(path):
+    """The inspector's own surface is not an exception to the rule above.
+
+    `/trace/pipelines` carries no user data, but it names every stage of the
+    system and the file each one lives in — the same class of information
+    `docs_enabled: false` exists to withhold. The other two carry the user's
+    question and excerpts of their documents.
+    """
+    assert _client(docs_enabled=False).get(path).status_code == 401

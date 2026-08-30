@@ -12,9 +12,11 @@ from graphrag.retrieval.base import Retriever
 from graphrag.retrieval.fusion import reciprocal_rank_fusion
 from graphrag.retrieval.graph_augmented import GraphAugmentedRetriever
 from graphrag.retrieval.plan import active_plan
-from graphrag.retrieval.reranker import Reranker
+from graphrag.retrieval.reranker import CALIBRATED, Reranker, describe
 from graphrag.retrieval.vector import VectorRetriever
 from graphrag.storage.graph.base import GraphStore
+from graphrag.trace import step
+from graphrag.trace import steps as trace_steps
 
 
 class HybridRetriever(Retriever):
@@ -31,6 +33,21 @@ class HybridRetriever(Retriever):
         self._graph = graph
         self._reranker = reranker
         self._candidate_k = candidate_k
+
+    def _leg(self, name: str, fn, query: str, candidate_k: int) -> list[RetrievedChunk]:
+        """One retrieval leg, traced. Called inside the pool, under this leg's
+        own context copy — which is what makes the step nest under the tool call
+        that spawned it rather than under whichever sibling started last."""
+        with step(name, query=query, candidate_k=candidate_k) as s:
+            chunks = fn(query, candidate_k)
+            s.output(
+                results=len(chunks),
+                top=[
+                    {"chunk_id": c.chunk_id, "source": c.source, "score": round(c.score, 4)}
+                    for c in chunks[:5]
+                ],
+            )
+            return chunks
 
     def retrieve(self, query: str, k: int) -> list[RetrievedChunk]:
         plan = active_plan()
@@ -49,14 +66,61 @@ class HybridRetriever(Retriever):
         # and the values inside are shared object references, so the sink still
         # accumulates across all three.
         legs = (
-            (self._vector.retrieve, query, candidate_k),
-            (self._graph_aug.retrieve, query, candidate_k),
-            (self._graph.fulltext_chunks, query, candidate_k),
+            (trace_steps.RETRIEVAL_VECTOR, self._vector.retrieve),
+            (trace_steps.RETRIEVAL_GRAPH, self._graph_aug.retrieve),
+            (trace_steps.RETRIEVAL_KEYWORD, self._graph.fulltext_chunks),
         )
         with ThreadPoolExecutor(max_workers=3) as pool:
-            futures = [pool.submit(copy_context().run, *leg) for leg in legs]
+            futures = [
+                pool.submit(copy_context().run, self._leg, name, fn, query, candidate_k)
+                for name, fn in legs
+            ]
             lists: list[list[RetrievedChunk]] = [f.result() for f in futures]
-        fused = reciprocal_rank_fusion(lists)[:candidate_k]
+
+        with step(
+            trace_steps.RETRIEVAL_FUSE,
+            vector=len(lists[0]), graph=len(lists[1]), keyword=len(lists[2]),
+        ) as s:
+            fused = reciprocal_rank_fusion(lists)[:candidate_k]
+            s.output(
+                candidates=len(fused),
+                top=[
+                    {"chunk_id": c.chunk_id, "source": c.source, "rrf": round(c.score, 5)}
+                    for c in fused[:8]
+                ],
+            )
+
         if plan is not None and not plan.rerank:
+            with step(trace_steps.RETRIEVAL_RERANK, candidates=len(fused)) as s:
+                s.skip("the retrieval plan for this run disabled reranking")
             return fused[:k]
-        return self._reranker.rerank(query, fused, k)
+
+        # Traced here rather than inside the rerankers: there are five
+        # implementations plus a fallback chain, and everything worth showing —
+        # which provider answered, whether the scores came back calibrated, how
+        # the order changed — is visible from this side of the call.
+        with step(
+            trace_steps.RETRIEVAL_RERANK,
+            provider=describe(self._reranker),
+            candidates=len(fused),
+            top_k=k,
+        ) as s:
+            ranked = self._reranker.rerank(query, fused, k)
+            before = {c.chunk_id: i for i, c in enumerate(fused)}
+            s.output(
+                results=len(ranked),
+                calibrated=bool(ranked and ranked[0].metadata.get(CALIBRATED, True)),
+                top=[
+                    {
+                        "chunk_id": c.chunk_id,
+                        "source": c.source,
+                        "score": round(c.score, 4),
+                        # Where this chunk sat before reranking — the whole
+                        # point of the stage, and invisible from the scores.
+                        "was_rank": before.get(c.chunk_id),
+                        "snippet": c.text[:280],
+                    }
+                    for c in ranked[:8]
+                ],
+            )
+            return ranked

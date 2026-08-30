@@ -75,6 +75,34 @@ For the full picture, see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ---
 
+## See how it answers — the pipeline inspector
+
+A tool-using agent, three retrieval legs, fusion, a reranker, two safety
+checks — most of that is invisible from a chat window, which shows an answer and
+a spinner. The **pipeline inspector** (`/pipeline` in the web app) draws each
+pipeline as a diagram and **lights up every block as a real run passes through
+it**. Click a block to see what that step actually received and returned — the
+function behind it, its input and output, how long it took, what it cost.
+
+```
+question ─▶ [input guard] ─▶ [gate] ─▶ [agent] ─▶ [tool] ─┬▶ [vector] ┐
+                                                          ├▶ [graph]  ├▶ [RRF] ─▶ [rerank]
+                                                          └▶ [keyword]┘
+              ─▶ [citation check] ─▶ [output guard] ─▶ [answer + tokens]
+```
+
+It covers all three pipelines — **answering**, **ingestion** (load → chunk →
+embed → extract → resolve → summarize), and the **review loop** — and a run is a
+real run: it calls the same models and counts against the same quota as asking
+in Chat, and the answer is only shown once the output guard has cleared it.
+
+The mechanism is a per-run step recorder (`graphrag.trace`) bound the same way
+the token meter and source collector already are — so with nothing watching it
+costs a single context-variable read, and the normal query path is unchanged.
+On by default; set `trace.enabled: false` to remove the surface entirely.
+
+---
+
 ## New: two features, built in — safety & observability
 
 This is the head of a three-project series. Its two companions — linked in the
@@ -308,6 +336,9 @@ curl -H "Authorization: Bearer grk_…" -X POST localhost:8000/query \
 | `POST` | `/query` | Ask a question. Streams the answer (SSE) by default; returns sources used. Takes `preset` (the job) and, on a new thread, `shelf_id`. |
 | `POST` | `/compare` | Side-by-side comparison of several subjects. |
 | `POST` | `/search` | Raw hybrid retrieval, no LLM — see exactly what the retriever returns. |
+| `GET`  | `/trace/pipelines` | The pipeline diagrams (nodes + edges) the inspector draws. |
+| `POST` | `/trace/query` | Run a real question with the inspector watching — streams each step (SSE), then the answer. Billed like `/query`. |
+| `GET`  | `/trace/runs` · `/trace/{id}` | Your recent traced runs, and one finished run (query or ingest) by id. |
 | `POST` | `/ingest` | Ingest a server-side path (under `data/`) **or an http(s) URL** (background job). |
 | `POST` | `/ingest/upload` | Upload and ingest a file. |
 | `GET`  | `/ingest/{job_id}` | Check ingest progress. |
@@ -528,12 +559,17 @@ src/graphrag/
 ├── jobs.py         Ingest job status, persisted in Redis
 ├── worker.py       Arq worker — optional; ingest runs in-process by default
 ├── auth.py         The API-key format (SHA-256 hashed, shown once)
+├── trace/          Per-run step recorder behind the pipeline inspector
+│   ├── steps.py      The block registry — one source of truth for the diagram
+│   ├── recorder.py   ContextVar-bound tracer; a no-op when nothing is watching
+│   └── store.py      Finished traces in Redis (mirrors jobs.py), owner-scoped
 ├── __main__.py     The `graphrag` CLI
-├── api/            FastAPI: routers · SSE streaming · deps · /metrics
+├── api/            FastAPI: routers (incl. /trace) · SSE streaming · deps · /metrics
 └── container.py    Composition root: reads config, builds everything, once
 
 migrations/         Alembic — the Postgres schema, versioned
-frontend/           React + Vite: the chat app (chat · documents · account)
+frontend/           React + Vite: the chat app (chat · documents · account ·
+                    pipeline inspector at /pipeline)
 admin/              React + Vite: the admin console, a separate app at /admin
 configs/            The YAML profiles — default · production · local · api
 docker/             API image + proxy image (builds both apps) + Caddyfile

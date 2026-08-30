@@ -45,6 +45,7 @@ from graphrag.limits import effective_limits, reject_with
 from graphrag.limits.service import LimitBreach, Limits
 from graphrag.pipelines import IngestPipeline
 from graphrag.shelves import ShelfRef, chunks_elsewhere, shelf_by_id, shelf_for_request
+from graphrag.trace.ingest import run_traced
 from graphrag.usage import INGEST_CHUNKS, UPLOAD
 
 router = APIRouter(tags=["ingest"])
@@ -75,13 +76,19 @@ _INGEST_SLOT = asyncio.Semaphore(1)
 
 def _inproc_ingest(
     container: Container, store: JobStore, job_id: str, path: str, user_id,
-    max_chunks: int | None = None, shelf: str | None = None,
+    max_chunks: int | None = None, shelf: str | None = None, trace_store=None,
 ) -> None:
     """Run the pipeline and record the outcome. Blocking — call it off the loop."""
     store.set(JobStatus(job_id, status="running", owner=user_id))
     try:
-        stats = IngestPipeline(container, max_chunks=max_chunks).run(
-            path, user_id=user_id, shelf=shelf
+        # Traced under the *job* id, so the inspector page can read the
+        # steps back by the same id it already polls for status.
+        stats = run_traced(
+            IngestPipeline(container, max_chunks=max_chunks),
+            path, user_id, shelf,
+            job_id=job_id,
+            settings=container.settings,
+            trace_store=trace_store,
         )
         # "partial" when the text is searchable but the knowledge graph is not:
         # extraction failed for at least one chunk. Reporting that as "done"
@@ -117,11 +124,13 @@ async def _run_ingest(
     container: Container, store: JobStore, job_id: str, path: str, user_id,
     max_chunks: int | None = None, db=None, file_id: str | None = None,
     recorder=None, account_id: str | None = None, shelf: str | None = None,
+    trace_store=None,
 ):
     """One queued ingest, off the event loop so streaming stays responsive."""
     async with _INGEST_SLOT:
         await asyncio.to_thread(
-            _inproc_ingest, container, store, job_id, path, user_id, max_chunks, shelf
+            _inproc_ingest, container, store, job_id, path, user_id, max_chunks,
+            shelf, trace_store,
         )
     status = store.get(job_id)
     await finalize_file(db, file_id, status)
@@ -165,6 +174,7 @@ async def _enqueue(
         background.add_task(
             _run_ingest, container, store, job_id, path, user_id, max_chunks, db,
             file_id, recorder, account_id, shelf,
+            getattr(request.app.state, "trace_store", None),
         )
     return IngestResponse(job_id=job_id, status="queued")
 

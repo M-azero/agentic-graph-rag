@@ -89,6 +89,41 @@ required because `/query` streams over `astream`. The streaming path also emits
 `tool` events as the agent picks strategies, so the UI can show activity instead
 of sitting silent through retrieval.
 
+## Observing a run — the pipeline inspector
+
+The retrieval path is deep: the work happens inside a compiled LangGraph that
+outlives the query, several thread pools down (three retrieval legs, then a
+rerank pool). Three per-run values already reach into that depth through
+`ContextVar`s — the source collector (`agent/tools.py`), the retrieval plan
+(`retrieval/plan.py`), and the token meter (`usage/meter.py`) — because every
+fan-out point copies the context. The **step recorder** (`graphrag.trace`) is a
+fourth of the same kind.
+
+- **`trace/recorder.py`** — a `Tracer` bound with `use_tracer()`, exactly like
+  the meter. `step(name, …)` is a context manager that records a block's input,
+  output, timing, and status. With no tracer bound it yields a null handle and
+  costs one `ContextVar` read, so the ordinary query path is untouched — that is
+  the property that lets the instrumentation live on the hot path. The parent of
+  each step travels in its own `ContextVar`, so the three concurrent retrieval
+  legs nest under the tool call that spawned them rather than under each other.
+- **`trace/steps.py`** — the block registry: one table of names, labels, and the
+  source file each lives in. Instrumentation emits these names and
+  `GET /trace/pipelines` serves the diagram built from the same table, so the
+  picture cannot drift from the code (a unit test walks the source to enforce it).
+- **`trace/store.py`** — finished traces in Redis with a TTL, a bounded
+  in-process fallback, owner-scoped reads. A mirror of `jobs.py`, and for the
+  same reason: an ingest may run in a separate worker process, so its trace has
+  to travel through a shared store rather than live in the API's memory.
+
+`api/routers/trace.py` runs a real query with a tracer bound and streams the
+steps as Server-Sent Events, then one `answer` event **after the output guard
+has cleared it** — so streaming the steps never weakens the block/redact
+guarantee that moved the answer itself off SSE. A traced run goes through the
+same quota enforcement and token accounting as `/query`; it is a real request,
+not a simulation. Ingestion is traced under its job id and read back by the page
+rather than streamed, because it runs off the request. `trace.enabled: false`
+returns 404 for the whole surface and binds no tracer.
+
 ## Why these choices
 
 - **Neo4j as the default store** — mature Cypher, a native vector index, and

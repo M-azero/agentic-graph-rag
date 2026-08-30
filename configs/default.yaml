@@ -236,3 +236,16 @@ api:
                               # enough: MAX_UPLOAD_MB in .env must be >= it, or
                               # Caddy 413s the upload first.
   max_files_per_user: 10      # cap on uploaded files per user
+
+# --- Pipeline inspector (the /pipeline page) ----------------------------------
+# In-request step tracing that drives the live diagram — what each block of a
+# run received and returned. NOT the same as `observability` above: that ships
+# spans to an external llmlens server; this records one run in-process for a UI,
+# and every trace is scoped to the tenant that produced it. On by default, and
+# inert until a run asks for it (an untraced query pays one context-var read).
+trace:
+  enabled: true
+  include_text: true          # false -> long strings replaced by their length
+  max_steps: 200              # a longer run is truncated, with a marker
+  max_preview_chars: 1200     # per-string cap on any value stored in a step
+  ttl_seconds: 3600           # how long a finished trace is kept in Redis

@@ -269,6 +269,27 @@ never relax the grounding, citation or refusal rules above it in the prompt.
 | `agent.default_preset` | Preset for a shelf that names none, and for a request that sends none. Defaults to `general`, which defers to `agent.default_style` — that is what keeps pre-preset API clients rendering exactly the prompt they always did |
 | `agent.default_style`  | Phrasing used *only* under the `general` preset. A job preset replaces it, since both control the same axis |
 
+## Pipeline inspector (`trace`)
+
+Powers the `/pipeline` page — the live diagram of a real run (see
+[`ARCHITECTURE.md`](ARCHITECTURE.md#observing-a-run--the-pipeline-inspector)).
+On by default, because it is inert until a run asks for it: nothing binds a
+tracer on the ordinary query path, so an untraced request pays a single
+context-variable read.
+
+| Key                       | Default | What it does |
+|---------------------------|---------|--------------|
+| `trace.enabled`           | `true`  | Off returns 404 for the whole `/trace/*` surface and binds no tracer. Turn it off to hide the inspector entirely |
+| `trace.include_text`      | `true`  | With it off, long strings in a trace (chunk text, the question, the answer) are replaced by their length — the shape of a run stays visible without the document text itself |
+| `trace.max_steps`         | `200`   | A run that produces more steps is truncated, with one marker appended — bounds a looping agent's trace |
+| `trace.max_preview_chars` | `1200`  | Per-string cap on any input/output value stored in a step |
+| `trace.ttl_seconds`       | `3600`  | How long a finished trace is kept in Redis |
+
+Every trace is scoped to the tenant that produced it and carries their question
+and excerpts of their documents, so `/trace/*` requires a caller and a foreign
+trace 404s. A traced run enforces the same message limits and records the same
+tokens as `/query` — it is a real request, billed normally.
+
 ## Secrets (`.env`)
 
 Only set the keys for providers you actually enable:

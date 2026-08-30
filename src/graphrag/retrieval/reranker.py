@@ -249,6 +249,23 @@ class FallbackReranker(Reranker):
         return _mark(chunks[:top_k], False)
 
 
+def describe(reranker: Reranker) -> str:
+    """A short name for whichever reranker is in play, for logs and the pipeline
+    inspector. Deliberately not a `__str__`: it names the *chain*, which is a
+    fact about how the thing was built rather than about the object."""
+    if isinstance(reranker, FallbackReranker):
+        return " -> ".join(reranker._labels)
+    if isinstance(reranker, NoOpReranker):
+        return "none"
+    if isinstance(reranker, CrossEncoderReranker):
+        return "cross_encoder"
+    if isinstance(reranker, LLMReranker):
+        return f"{reranker.cfg.provider}:{reranker.cfg.model}"
+    if isinstance(reranker, APIReranker):
+        return f"{reranker._provider}:{reranker._model}"
+    return type(reranker).__name__
+
+
 def _build_one(provider: str, model: str, cfg: RerankCfg, secrets: Secrets) -> Reranker:
     if provider == "cross_encoder":
         return CrossEncoderReranker(model)

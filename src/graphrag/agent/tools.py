@@ -14,6 +14,8 @@ and capped so a hostile document can't flood the context."""
 
 from __future__ import annotations
 
+import functools
+import inspect
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -30,6 +32,8 @@ from graphrag.retrieval.hybrid import HybridRetriever
 from graphrag.retrieval.plan import active_plan
 from graphrag.retrieval.vector import VectorRetriever
 from graphrag.storage.graph.base import GraphStore
+from graphrag.trace import step
+from graphrag.trace import steps as trace_steps
 
 _MAX_CHUNK_CHARS = 4000
 _MAX_TOOL_OUTPUT_CHARS = 8000
@@ -191,6 +195,12 @@ def _note_label(label: str) -> None:
         sink.note_label(label)
 
 
+def _chunk_ids() -> list[str]:
+    """Chunk ids the query in flight has collected so far, or [] outside one."""
+    sink = _SINK.get()
+    return [c.chunk_id for c in sink.chunks] if sink is not None else []
+
+
 def build_tools(ctx: ToolContext) -> list[StructuredTool]:
     def _k() -> int:
         """How many results this call should return.
@@ -282,14 +292,56 @@ def build_tools(ctx: ToolContext) -> list[StructuredTool]:
 
         return _graph_data(COMMUNITY_LABEL, _global(ctx.graph, ctx.embedder, question))
 
+    def traced(fn):
+        """Record one `tool.call` step around a tool.
+
+        Wrapped here rather than inside each function so the nine stay readable
+        and none of them can forget. `functools.wraps` is not enough on its own:
+        `StructuredTool.from_function` derives the tool's *name*, *description*
+        and *argument schema* from the wrapped callable, so the wrapper has to
+        carry the docstring and the signature or the model is handed a tool
+        called "wrapper" taking **kwargs. Hence the explicit copy of
+        `__signature__` below.
+
+        Inert off a traced run: `step()` is one ContextVar read and the call
+        forwards unchanged.
+        """
+
+        @functools.wraps(fn)
+        def call(*args, **kwargs):
+            bound = inspect.signature(fn).bind(*args, **kwargs)
+            # `args` as one dict rather than splatted: a tool parameter is
+            # named `name` (get_entity) and would collide with step()'s own.
+            with step(
+                trace_steps.TOOL_CALL,
+                label=fn.__name__,
+                tool=fn.__name__,
+                args=dict(bound.arguments),
+            ) as s:
+                before = len(_chunk_ids())
+                out = fn(*args, **kwargs)
+                after = _chunk_ids()
+                s.output(
+                    text=out,
+                    chars=len(out),
+                    # What this call added to the citation pool, which is the
+                    # tool's real effect and is not visible in its return text.
+                    chunks_added=len(after) - before,
+                )
+                s.meta(k=_k(), graph_hops=_hops())
+                return out
+
+        call.__signature__ = inspect.signature(fn)
+        return call
+
     return [
-        StructuredTool.from_function(hybrid_search),
-        StructuredTool.from_function(vector_search),
-        StructuredTool.from_function(graph_neighbors),
-        StructuredTool.from_function(expand_subgraph),
-        StructuredTool.from_function(get_entity),
-        StructuredTool.from_function(fulltext_search),
-        StructuredTool.from_function(compare),
-        StructuredTool.from_function(read_around),
-        StructuredTool.from_function(global_search),
+        StructuredTool.from_function(traced(hybrid_search)),
+        StructuredTool.from_function(traced(vector_search)),
+        StructuredTool.from_function(traced(graph_neighbors)),
+        StructuredTool.from_function(traced(expand_subgraph)),
+        StructuredTool.from_function(traced(get_entity)),
+        StructuredTool.from_function(traced(fulltext_search)),
+        StructuredTool.from_function(traced(compare)),
+        StructuredTool.from_function(traced(read_around)),
+        StructuredTool.from_function(traced(global_search)),
     ]

@@ -27,6 +27,7 @@ from graphrag.container import Container
 from graphrag.core.logging import get_logger
 from graphrag.jobs import JobStore
 from graphrag.pipelines import QueryService
+from graphrag.trace import TraceStore
 
 log = get_logger(__name__)
 
@@ -401,6 +402,11 @@ def create_app(container: Container | None = None) -> FastAPI:
     app.state.container = container
     app.state.query_service = QueryService(container)
     app.state.job_store = JobStore(container.redis)
+    # Finished pipeline traces for the inspector page. Redis-backed when
+    # available so an ingest traced in the arq worker is readable here.
+    app.state.trace_store = TraceStore(
+        container.redis, ttl_seconds=container.settings.trace.ttl_seconds
+    )
     app.state.users = {container.settings.tenancy.default_user}
     # Real instances are built in the lifespan, once the database engine exists.
     # Limits work without one (falling back to the shipped defaults), so that
@@ -484,6 +490,7 @@ def create_app(container: Container | None = None) -> FastAPI:
         search,
         shelves,
         threads,
+        trace,
         users,
     )
 
@@ -496,4 +503,5 @@ def create_app(container: Container | None = None) -> FastAPI:
     app.include_router(ingest.router)
     app.include_router(query.router)
     app.include_router(search.router)
+    app.include_router(trace.router)
     return app

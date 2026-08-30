@@ -22,9 +22,12 @@ from pathlib import Path
 
 from graphrag.container import Container, Tenant
 from graphrag.core.logging import get_logger
+from graphrag.core.redact import safe_detail
 from graphrag.ingestion.chunking.router import route
 from graphrag.ingestion.enrich import build_communities, resolve_entities
 from graphrag.ingestion.loaders import iter_documents
+from graphrag.trace import step
+from graphrag.trace import steps as trace_steps
 
 log = get_logger(__name__)
 
@@ -49,6 +52,31 @@ class IngestStats:
 class LimitExceededError(RuntimeError):
     """The ingest would push the user past a quota. Surfaced as a failed job
     with a message the UI can show, not a stack trace."""
+
+
+def _traced_documents(documents):
+    """Yield each loaded document as its own `ingest.load` step.
+
+    `iter_documents` is a generator, so loading document N+1 happens when this
+    loop asks for it — timing it means stepping the generator by hand rather
+    than wrapping the `for`.
+    """
+    while True:
+        with step(trace_steps.INGEST_LOAD) as s:
+            try:
+                document = next(documents)
+            except StopIteration:
+                s.skip("no more files")
+                return
+            meta = document.metadata or {}
+            s.output(
+                source=document.source,
+                chars=len(document.content or ""),
+                loader=meta.get("loader", ""),
+                ocr_pages=meta.get("ocr_pages") or (1 if meta.get("ocr") else 0),
+                preview=(document.content or "")[:400],
+            )
+        yield document
 
 
 class IngestPipeline:
@@ -109,14 +137,25 @@ class IngestPipeline:
         stats = IngestStats()
         extract = c.settings.ingestion.extract_graph
 
-        for document in iter_documents(
+        documents = iter_documents(
             path, ocr=c.ocr, min_text_chars=c.settings.ocr.min_text_chars
-        ):
+        )
+        for document in _traced_documents(documents):
             if not document.content.strip():
                 log.warning("empty_document", source=document.source)
                 continue
 
-            chunks = self._chunk(document)
+            with step(trace_steps.INGEST_CHUNK, source=document.source) as s:
+                chunks = self._chunk(document)
+                s.output(
+                    chunks=len(chunks),
+                    strategy=(
+                        chunks[0].metadata.get("chunk_strategy")
+                        if chunks else None
+                    ) or c.settings.chunking.strategy,
+                    sizes=[len(ch.text) for ch in chunks[:12]],
+                    first=chunks[0].text if chunks else "",
+                )
             if not chunks:
                 continue
 
@@ -129,10 +168,29 @@ class IngestPipeline:
             # measured against the space it is about to free.
             self._check_capacity(tenant, len(chunks))
 
-            embeddings = c.embedder.embed_documents([ch.text for ch in chunks])
+            with step(trace_steps.INGEST_EMBED, chunks=len(chunks)) as s:
+                embeddings = c.embedder.embed_documents([ch.text for ch in chunks])
+                s.output(
+                    vectors=len(embeddings),
+                    dim=len(embeddings[0]) if embeddings else 0,
+                    model=c.settings.embeddings.model,
+                )
             for ch, vec in zip(chunks, embeddings, strict=True):
                 ch.embedding = vec
-            tenant.vector_store.upsert(chunks)
+            with step(
+                trace_steps.INGEST_VECTOR_UPSERT,
+                chunks=len(chunks),
+                provider=c.settings.storage.vector.provider,
+                corpus=tenant.corpus,
+            ):
+                tenant.vector_store.upsert(chunks)
+            with step(
+                trace_steps.INGEST_GRAPH_CHUNKS,
+                chunks=len(chunks),
+                provider=c.settings.storage.vector.provider,
+            ) as s:
+                if c.settings.storage.vector.provider == "neo4j":
+                    s.skip("vectors live in the graph; the store wrote the nodes")
             if c.settings.storage.vector.provider != "neo4j":
                 # Vectors live elsewhere, but fulltext search and MENTIONS
                 # edges still need the chunk nodes in the graph.
@@ -141,7 +199,8 @@ class IngestPipeline:
             # nodes: the Neo4j vector store writes them when vectors live in
             # the graph, `upsert_chunks` when they don't. Linking here is what
             # makes the :NEXT chain exist under every vector provider.
-            tenant.graph_store.link_chunk_sequence(chunks)
+            with step(trace_steps.INGEST_LINK_SEQUENCE, chunks=len(chunks)):
+                tenant.graph_store.link_chunk_sequence(chunks)
 
             if extract:
                 self._build_graph(tenant, chunks, stats)
@@ -163,33 +222,75 @@ class IngestPipeline:
         # ingest — so those calls run concurrently. Writes stay serial:
         # concurrent MERGEs on the same entity keys only fight for locks.
         workers = max(1, self._c.settings.ingestion.max_concurrency)
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            extracted = list(pool.map(self._c.extractor.extract, [c.text for c in chunks]))
-
-        for chunk, result in zip(chunks, extracted, strict=True):
-            if result.failed:
-                stats.extraction_failures += 1
-                continue
-            if not result.entities:
-                continue
-            tenant.graph_store.add_entities(result.entities)
-            tenant.graph_store.add_relations(result.relations)
-            tenant.graph_store.link_chunk_entities(
-                chunk.id, [e.key for e in result.entities]
+        # Timed as one step, not one per chunk: `pool.map` submits under an
+        # empty context by design here, so a tracer bound outside does not
+        # reach the workers and per-chunk timings would be invented. The
+        # per-chunk *results* are recorded below, where they are real.
+        with step(
+            trace_steps.INGEST_EXTRACT, chunks=len(chunks), concurrency=workers
+        ) as s:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                extracted = list(
+                    pool.map(self._c.extractor.extract, [c.text for c in chunks])
+                )
+            s.output(
+                failed=sum(1 for r in extracted if r.failed),
+                entities=sum(len(r.entities) for r in extracted if not r.failed),
+                relations=sum(len(r.relations) for r in extracted if not r.failed),
+                sample=[
+                    {"name": e.name, "type": e.type}
+                    for r in extracted if not r.failed
+                    for e in r.entities
+                ][:12],
             )
-            stats.entities += len(result.entities)
-            stats.relations += len(result.relations)
+
+        with step(trace_steps.INGEST_GRAPH_WRITE, chunks=len(chunks)) as s:
+            written = 0
+            for chunk, result in zip(chunks, extracted, strict=True):
+                if result.failed:
+                    stats.extraction_failures += 1
+                    continue
+                if not result.entities:
+                    continue
+                tenant.graph_store.add_entities(result.entities)
+                tenant.graph_store.add_relations(result.relations)
+                tenant.graph_store.link_chunk_entities(
+                    chunk.id, [e.key for e in result.entities]
+                )
+                stats.entities += len(result.entities)
+                stats.relations += len(result.relations)
+                written += 1
+            s.output(
+                chunks_written=written,
+                entities=stats.entities,
+                relations=stats.relations,
+                extraction_failures=stats.extraction_failures,
+            )
 
     def _enrich(self, tenant: Tenant) -> None:
         cfg = self._c.settings.ingestion
-        try:
-            resolve_entities(tenant.graph_store, self._c.embedder, cfg.resolve_entities)
-        except Exception as exc:  # enrichment must never fail the ingest
-            log.warning("entity_resolution_failed", error=str(exc))
-        try:
-            build_communities(
-                tenant.graph_store, self._c.embedder, self._c.extractor_llm,
-                cfg.communities,
-            )
-        except Exception as exc:
-            log.warning("community_build_failed", error=str(exc))
+        with step(
+            trace_steps.INGEST_RESOLVE, enabled=cfg.resolve_entities.enabled
+        ) as s:
+            try:
+                merged = resolve_entities(
+                    tenant.graph_store, self._c.embedder, cfg.resolve_entities
+                )
+                s.output(merged=merged)
+            except Exception as exc:  # enrichment must never fail the ingest
+                log.warning("entity_resolution_failed", error=str(exc))
+                # Recorded, not raised: the step reports the degradation
+                # without changing that enrichment is best-effort.
+                s.meta(failed=True, error=safe_detail(exc))
+        with step(
+            trace_steps.INGEST_COMMUNITIES, enabled=cfg.communities.enabled
+        ) as s:
+            try:
+                built = build_communities(
+                    tenant.graph_store, self._c.embedder, self._c.extractor_llm,
+                    cfg.communities,
+                )
+                s.output(communities=built)
+            except Exception as exc:
+                log.warning("community_build_failed", error=str(exc))
+                s.meta(failed=True, error=safe_detail(exc))

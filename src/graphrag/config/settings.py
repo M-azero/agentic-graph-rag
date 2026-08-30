@@ -413,6 +413,29 @@ class ObservabilityCfg(BaseModel):
     service: str = "agentic-graph-rag"   # service name stamped on traces
 
 
+class TraceCfg(BaseModel):
+    """Pipeline step tracing — what the /pipeline inspector page draws.
+
+    Distinct from `observability` (llmlens, which ships spans to an external
+    server): this records the steps of one run in-process so a UI can show what
+    each block received and returned.
+
+    On by default because it is inert until a run asks for it — nothing binds a
+    tracer on the ordinary query path, and an unbound `step()` is one ContextVar
+    read. Every trace is scoped to the tenant that produced it and expires.
+
+    `include_text` is the knob a cautious deployment reaches for: with it off,
+    long strings in a trace are replaced by their length, so the shape of a run
+    stays visible without the document text itself.
+    """
+
+    enabled: bool = True
+    include_text: bool = True
+    max_steps: int = 200
+    max_preview_chars: int = 1200
+    ttl_seconds: int = 3600
+
+
 class Settings(BaseModel):
     """The fully-resolved, non-secret configuration."""
 
@@ -431,6 +454,7 @@ class Settings(BaseModel):
     # --- integrated feature projects (both off by default) ---
     safety: SafetyCfg = Field(default_factory=SafetyCfg)
     observability: ObservabilityCfg = Field(default_factory=ObservabilityCfg)
+    trace: TraceCfg = Field(default_factory=TraceCfg)
 
 
 class Secrets(BaseSettings):

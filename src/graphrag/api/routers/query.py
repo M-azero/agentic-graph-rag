@@ -38,6 +38,8 @@ from graphrag.llm.registry import resolve_model
 from graphrag.pipelines import QueryService
 from graphrag.retrieval.reranker import CALIBRATED
 from graphrag.shelves import shelf_by_id, shelf_for_request
+from graphrag.trace import step
+from graphrag.trace import steps as trace_steps
 from graphrag.usage import TokenMeter, estimate_tokens, record_answer_tokens
 
 router = APIRouter(tags=["query"])
@@ -104,9 +106,21 @@ def _review_citations(answer: str, result) -> tuple[list, CitationReport]:
     - **Cited sources sort first** and are marked, so a client can separate the
       evidence the answer used from what retrieval merely surfaced.
     """
-    report = verify_citations(
-        answer, available_sources(result.sources, result.source_labels)
-    )
+    with step(
+        trace_steps.CHECK_CITATIONS,
+        answer=answer,
+        retrieved=len(result.sources),
+        labels=list(result.source_labels),
+    ) as s:
+        report = verify_citations(
+            answer, available_sources(result.sources, result.source_labels)
+        )
+        s.output(
+            cited=sorted(report.cited),
+            fabricated=sorted(report.fabricated),
+            refusal=report.refusal,
+            available=sorted(report.available),
+        )
     if report.refusal:
         return [], report
     if report.fabricated:
@@ -282,6 +296,79 @@ async def _save_turn(
         get_logger(__name__).warning("transcript_save_failed", error=str(exc))
 
 
+async def _guard_input(guard, question: str):
+    """The input guard, traced. Returns the verdict."""
+    with step(trace_steps.GUARD_INPUT, question=question) as s:
+        if not guard.enabled:
+            s.skip("safety.enabled is false")
+            return None
+        verdict = await guard.check_input(question)
+        s.output(
+            action=verdict.action,
+            blocked=verdict.blocked,
+            flagged=verdict.flagged,
+            reasons=list(verdict.reasons),
+        )
+        return verdict
+
+
+async def _guard_output(guard, question: str, answer: str, sources):
+    """The output guard, traced. Returns the verdict, or None when off."""
+    with step(trace_steps.GUARD_OUTPUT, answer=answer, docs=len(sources)) as s:
+        if not guard.enabled:
+            s.skip("safety.enabled is false")
+            return None
+        verdict = await guard.check_output(question, answer, docs=_context_docs(sources))
+        s.output(
+            action=verdict.action,
+            blocked=verdict.blocked,
+            flagged=verdict.flagged,
+            modified=verdict.modified,
+            reasons=list(verdict.reasons),
+        )
+        return verdict
+
+
+async def _gate(service, question, container, tenant, meter, shelf):
+    """The closed-domain gate, traced. Returns True when the question passes.
+
+    The step records the score the decision turned on and the threshold it was
+    compared against, because "refused as off-topic" is the outcome a reader is
+    most likely to dispute.
+    """
+    min_rel = container.settings.retrieval.min_relevance
+    with step(trace_steps.GATE_PROBE, question=question, min_relevance=min_rel) as s:
+        if min_rel <= 0:
+            s.skip("retrieval.min_relevance is 0, so the gate is disabled")
+            return True
+        probe = await _probe(service, question, tenant, meter, shelf)
+        applies = bool(probe) and _gate_applies(probe)
+        passed = bool(probe) and not (applies and probe[0].score < min_rel)
+        s.output(
+            candidates=len(probe),
+            top_score=round(probe[0].score, 4) if probe else None,
+            calibrated=applies,
+            passed=passed,
+            top=[
+                {"source": c.source, "score": round(c.score, 4)} for c in probe[:5]
+            ],
+        )
+        return passed
+
+
+def _bill_step(meter, **meta) -> None:
+    """Record what the run cost. A step rather than a log line because the
+    inspector's whole point is that the expensive stages are visible."""
+    tokens_in, tokens_out = meter.totals
+    with step(trace_steps.BILLING, **meta) as s:
+        s.output(
+            input_tokens=tokens_in,
+            output_tokens=tokens_out,
+            model_calls=getattr(meter, "calls", 0),
+            provider_reported=getattr(meter, "reported", False),
+        )
+
+
 @router.post("/query", response_model=QueryResponse | None)
 async def query(
     req: QueryRequest,
@@ -311,33 +398,31 @@ async def query(
     # Guardrails input check — before the model runs. A block short-circuits the
     # whole request: no agent, no retrieval, no tokens spent. No-op when
     # safety.enabled is false (guard.check_input returns an `allow`).
-    if guard.enabled:
-        v_in = await guard.check_input(req.question)
-        if v_in.blocked:
-            refusal = v_in.refusal_message or _REFUSAL
-            await _save_turn(db, thread_id, req.question, refusal, [], model_name)
-            if stream:
-                return EventSourceResponse(sse_refusal(refusal))
-            return _response(refusal, [], [], _safety_info(v_in, "input"))
+    v_in = await _guard_input(guard, req.question)
+    if v_in is not None and v_in.blocked:
+        refusal = v_in.refusal_message or _REFUSAL
+        await _save_turn(db, thread_id, req.question, refusal, [], model_name)
+        if stream:
+            return EventSourceResponse(sse_refusal(refusal))
+        return _response(refusal, [], [], _safety_info(v_in, "input"))
 
     # Closed-domain gate: only answer when the knowledge base actually covers the
     # question. One probe retrieval; if nothing clears retrieval.min_relevance, we
     # refuse here — an off-topic question gets an honest "not in the KB" instead of
     # a general-knowledge answer. min_relevance = 0 disables the gate.
-    min_rel = container.settings.retrieval.min_relevance
-    if min_rel > 0:
-        probe = await _probe(service, req.question, user.tenant_id, meter, shelf.slug)
-        if not probe or (_gate_applies(probe) and probe[0].score < min_rel):
-            # The probe still cost tokens under a generative reranker, and a
-            # refused question is exactly when a caller would otherwise retry
-            # for free.
-            await _book(request, container, user, meter, {"style": req.style,
-                                                          "preset": preset,
-                                                          "refused": "off_topic"})
-            await _save_turn(db, thread_id, req.question, CLOSED_DOMAIN_REFUSAL, [], model_name)
-            if stream:
-                return EventSourceResponse(sse_message(CLOSED_DOMAIN_REFUSAL))
-            return _response(CLOSED_DOMAIN_REFUSAL, [], [])
+    if not await _gate(
+        service, req.question, container, user.tenant_id, meter, shelf.slug
+    ):
+        # The probe still cost tokens under a generative reranker, and a refused
+        # question is exactly when a caller would otherwise retry for free.
+        _bill_step(meter, refused="off_topic")
+        await _book(request, container, user, meter, {"style": req.style,
+                                                      "preset": preset,
+                                                      "refused": "off_topic"})
+        await _save_turn(db, thread_id, req.question, CLOSED_DOMAIN_REFUSAL, [], model_name)
+        if stream:
+            return EventSourceResponse(sse_message(CLOSED_DOMAIN_REFUSAL))
+        return _response(CLOSED_DOMAIN_REFUSAL, [], [])
 
     if stream:
         async def _out_guard(answer, sources):
@@ -391,10 +476,8 @@ async def query(
     # (withhold the answer) or redact (swap in the sanitized, PII-clean text).
     # The verdict rides back on the response so the UI can show why.
     safety = None
-    if guard.enabled:
-        v_out = await guard.check_output(
-            req.question, answer, docs=_context_docs(sources)
-        )
+    v_out = await _guard_output(guard, req.question, answer, sources)
+    if v_out is not None:
         if v_out.blocked:
             answer, sources, tool_calls = (v_out.refusal_message or _REFUSAL), [], []
             citations = None
@@ -402,6 +485,7 @@ async def query(
             answer = v_out.sanitized_output
         safety = _safety_info(v_out, "output")
 
+    _bill_step(meter, style=req.style, preset=preset, model=model_name)
     await record_answer_tokens(
         getattr(request.app.state, "usage", None), container.redis,
         tenant_id=user.tenant_id, account_id=user.user_id,
@@ -433,25 +517,24 @@ async def compare(
     preset = req.preset or shelf.preset
     meter = TokenMeter()
     guard = container.guardrails
-    if guard.enabled:
-        # Screen the composed question: subjects AND aspects are user-supplied,
-        # and either one can carry an injection.
-        v_in = await guard.check_input(question)
-        if v_in.blocked:
-            return _response(
-                v_in.refusal_message or _REFUSAL, [], [], _safety_info(v_in, "input")
-            )
+    # Screen the composed question: subjects AND aspects are user-supplied,
+    # and either one can carry an injection.
+    v_in = await _guard_input(guard, question)
+    if v_in is not None and v_in.blocked:
+        return _response(
+            v_in.refusal_message or _REFUSAL, [], [], _safety_info(v_in, "input")
+        )
 
-    min_rel = container.settings.retrieval.min_relevance
-    if min_rel > 0:
-        probe = await _probe(service, question, user.tenant_id, meter, shelf.slug)
-        if not probe or (_gate_applies(probe) and probe[0].score < min_rel):
-            await _book(
-                request, container, user, meter,
-                {"style": req.style, "preset": preset,
-                 "endpoint": "compare", "refused": "off_topic"},
-            )
-            return _response(CLOSED_DOMAIN_REFUSAL, [], [])
+    if not await _gate(
+        service, question, container, user.tenant_id, meter, shelf.slug
+    ):
+        _bill_step(meter, refused="off_topic", endpoint="compare")
+        await _book(
+            request, container, user, meter,
+            {"style": req.style, "preset": preset,
+             "endpoint": "compare", "refused": "off_topic"},
+        )
+        return _response(CLOSED_DOMAIN_REFUSAL, [], [])
 
     result = await service.aanswer(
         question, style=req.style, thread_id=req.thread_id, user_id=user.tenant_id,
@@ -466,8 +549,8 @@ async def compare(
     sources, citations = _review_citations(answer, result)
 
     safety = None
-    if guard.enabled:
-        v_out = await guard.check_output(question, answer, docs=_context_docs(sources))
+    v_out = await _guard_output(guard, question, answer, sources)
+    if v_out is not None:
         if v_out.blocked:
             answer, sources, tool_calls = (v_out.refusal_message or _REFUSAL), [], []
             citations = None
@@ -478,6 +561,7 @@ async def compare(
     # /compare never streams, so it was the other half of the unmetered path —
     # and it composes a table over several subjects, making it the *more*
     # expensive of the two per call.
+    _bill_step(meter, style=req.style, preset=preset, endpoint="compare")
     await record_answer_tokens(
         getattr(request.app.state, "usage", None), container.redis,
         tenant_id=user.tenant_id, account_id=user.user_id,

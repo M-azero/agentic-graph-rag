@@ -1,5 +1,6 @@
 import clsx from "clsx";
 import {
+  GitBranch,
   LogOut,
   MessageSquare,
   Monitor,
@@ -97,6 +98,9 @@ export function AppShell({ children }: { children: ReactNode }) {
         <nav className="ml-2 flex items-center gap-1">
           <NavItem to="/chat" icon={<MessageSquare className="h-3.5 w-3.5" />}>
             Chat
+          </NavItem>
+          <NavItem to="/pipeline" icon={<GitBranch className="h-3.5 w-3.5" />}>
+            Pipeline
           </NavItem>
         </nav>
 

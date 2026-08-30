@@ -351,3 +351,134 @@ export const listFiles = (shelfId?: string | null) =>
 
 export const deleteFile = (fileId: string) =>
   request<{ chunks_removed: number }>(`/ingest/files/${fileId}`, { method: "DELETE" });
+
+// -- pipeline inspector -------------------------------------------------------
+//
+// The one place SSE is still right. The chat path abandoned it because a
+// streamed *answer* cannot be pulled back once the output guard rules on it
+// (see the header of this file); here only the *steps* stream, and the answer
+// arrives in a single event the server does not send until the guard has run.
+// So the diagram lights up live and the guarantee is unchanged.
+
+/** One block of the pipeline, as the registry declares it. */
+export interface PipelineNode {
+  name: string;
+  label: string;
+  kind: string;
+  source: string;
+  summary: string;
+  repeats: boolean;
+  optional: boolean;
+}
+
+export interface PipelineGraph {
+  pipeline: string;
+  nodes: PipelineNode[];
+  edges: { from: string; to: string }[];
+}
+
+/** One block of the pipeline, as it actually ran. */
+export interface TraceStep {
+  id: string;
+  parent_id: string | null;
+  name: string;
+  label: string;
+  kind: string;
+  status: "running" | "ok" | "error" | "skipped";
+  started_ms: number;
+  ended_ms: number | null;
+  duration_ms: number | null;
+  input: Record<string, unknown>;
+  output: Record<string, unknown>;
+  meta: Record<string, unknown>;
+  error: string | null;
+}
+
+export interface TraceRecord {
+  trace_id: string;
+  pipeline: string;
+  status: string;
+  title: string;
+  started_at: number;
+  duration_ms: number;
+  steps: TraceStep[];
+  meta: Record<string, unknown>;
+}
+
+export interface TraceRunSummary {
+  trace_id: string;
+  pipeline: string;
+  title: string;
+  status: string;
+  duration_ms: number;
+  steps: number;
+  at: number;
+}
+
+export interface TraceAnswer {
+  trace_id: string;
+  answer: string;
+  sources: Source[];
+  safety: SafetyInfo | null;
+  outcome: string;
+}
+
+function parseEvent(raw: string): { event: string; data: string } {
+  let event = "message";
+  const dataLines: string[] = [];
+  for (const line of raw.split("\n")) {
+    if (line.startsWith("event:")) event = line.slice(6).trim();
+    else if (line.startsWith("data:")) dataLines.push(line.slice(5).replace(/^ /, ""));
+  }
+  return { event, data: dataLines.join("\n") };
+}
+
+export interface TraceHandlers {
+  onStep: (step: TraceStep) => void;
+  onAnswer: (answer: TraceAnswer) => void;
+}
+
+/** Run one real question with the inspector watching. Resolves when the run
+ *  ends; rejects on an `error` event or a non-2xx response. */
+export async function traceQuery(
+  body: { question: string; preset?: string; model?: string; shelf_id?: string | null },
+  handlers: TraceHandlers,
+  signal?: AbortSignal,
+): Promise<void> {
+  const res = await fetch(`${API}/trace/query`, {
+    method: "POST",
+    credentials: "include",
+    headers: headers({ "Content-Type": "application/json" }),
+    body: JSON.stringify(body),
+    signal,
+  });
+  // An error response is JSON, not a stream: run it through the same handling
+  // every other call uses so a 429 still carries its quota detail.
+  if (!res.ok) await jsonOrThrow(res);
+  if (!res.body) throw new Error("No response stream");
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    const frames = buffer.split("\n\n");
+    buffer = frames.pop() ?? "";
+    for (const raw of frames) {
+      const { event, data } = parseEvent(raw);
+      if (event === "step") handlers.onStep(JSON.parse(data) as TraceStep);
+      else if (event === "answer") handlers.onAnswer(JSON.parse(data) as TraceAnswer);
+      else if (event === "error") throw new Error(data);
+    }
+  }
+}
+
+export const trace = {
+  pipelines: () => request<{ pipelines: PipelineGraph[] }>("/trace/pipelines"),
+  runs: () => request<{ runs: TraceRunSummary[] }>("/trace/runs"),
+  read: (id: string) => request<TraceRecord>(`/trace/${encodeURIComponent(id)}`),
+};

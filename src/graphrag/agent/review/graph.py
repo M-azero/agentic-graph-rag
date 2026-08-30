@@ -47,8 +47,18 @@ from graphrag.agent.tools import SourceSink
 from graphrag.core.logging import get_logger
 from graphrag.core.types import RetrievedChunk
 from graphrag.retrieval.plan import RetrievalPlan
+from graphrag.trace import step
+from graphrag.trace import steps as trace_steps
 
 log = get_logger(__name__)
+
+
+def _tool_name(call: Any) -> str:
+    """The tool a recorded call names. Tolerant of shape: this is a display
+    field on a trace, and it must not be able to fail an answer."""
+    if isinstance(call, dict):
+        return str(call.get("tool") or call.get("name") or "?")
+    return str(call)
 
 
 class ReviewRunner:
@@ -81,12 +91,30 @@ class ReviewRunner:
         self._base_plan = base_plan or RetrievalPlan()
         self._compiled = self._build()
 
+    # -- tracing -------------------------------------------------------------
+
+    @staticmethod
+    def _step(name: str, **payload: Any):
+        """Record one review node, returning a callable that closes it.
+
+        A callable rather than the usual `with step(...)` block because every
+        node here has several return points, and wrapping each body would mean
+        re-indenting logic whose shape is the interesting part. The step opens
+        and closes immediately; the returned function fills in the output once
+        the node knows it. Off a traced run it is a no-op.
+        """
+        with step(name, **payload) as handle:
+            return lambda **out: handle.output(**out)
+
     # -- nodes ---------------------------------------------------------------
 
     async def _research(self, state: ReviewState) -> dict[str, Any]:
         """Run the ReAct agent and collect its draft plus its evidence."""
         rounds = state.get("rounds", 0)
         escalating = rounds > 0
+        traced = self._step(
+            trace_steps.REVIEW_RESEARCH, round=rounds + 1, escalating=escalating
+        )
 
         question = state["question"]
         if escalating and (verdict := state.get("verdict")) and verdict.missing:
@@ -116,6 +144,12 @@ class ReviewRunner:
         merged = list(sink.chunks) + [
             c for c in state.get("window_gain", []) if c not in sink.chunks
         ]
+        traced(
+            question=question,
+            draft=result.answer,
+            tools=[_tool_name(tc) for tc in result.tool_calls],
+            sources=len(merged),
+        )
         return {
             "draft": result.answer,
             "tool_calls": (state.get("tool_calls") or []) + result.tool_calls,
@@ -129,8 +163,15 @@ class ReviewRunner:
         draft = state.get("draft", "")
         available = available_sources(state.get("sources", []), state.get("labels", []))
         report = verify_citations(draft, available)
+        traced = self._step(
+            trace_steps.REVIEW_CHECK,
+            round=state.get("rounds", 0),
+            available=len(available),
+        )
 
         if report.refusal:
+            traced(action=SHIP, outcome=REFUSED, critic_called=False,
+                   reason="the draft is a refusal")
             return {"report": report, "action": SHIP, "outcome": REFUSED}
 
         out: dict[str, Any] = {"report": report}
@@ -139,6 +180,11 @@ class ReviewRunner:
             free_tool_calls=self._free_tool_calls, free_chars=self._free_chars,
         ):
             out["action"] = SHIP
+            traced(
+                action=SHIP, critic_called=False,
+                cited=sorted(report.cited), fabricated=sorted(report.fabricated),
+                reason="the free citation check settled it; no model call needed",
+            )
             return out
 
         verdict = await run_critic(
@@ -154,6 +200,15 @@ class ReviewRunner:
             action = REVISE if not report.clean or not verdict.complete else SHIP
             out["outcome"] = ESCALATED
         out["action"] = action
+        traced(
+            action=action,
+            critic_called=True,
+            complete=verdict.complete,
+            missing=verdict.missing,
+            cited=sorted(report.cited),
+            fabricated=sorted(report.fabricated),
+            capped=out.get("outcome") == ESCALATED,
+        )
         return out
 
     def _widen(self, state: ReviewState) -> dict[str, Any]:
@@ -162,6 +217,7 @@ class ReviewRunner:
         repair, against a full retrieval pass with an embedding call and a
         rerank."""
         sources = state.get("sources", [])
+        traced = self._step(trace_steps.REVIEW_WIDEN, known_sources=len(sources))
         ids = [c.chunk_id for c in sources[:8] if c.chunk_id]
         gained: list[RetrievedChunk] = []
         if ids and any(self._window):
@@ -173,18 +229,24 @@ class ReviewRunner:
                 log.warning("chunk_window_failed", error=str(exc))
         known = {c.chunk_id for c in sources}
         fresh = [c for c in gained if c.chunk_id not in known]
-        return {
-            "plan": (state.get("plan") or self._base_plan).widened(),
-            "window_gain": fresh,
-        }
+        widened = (state.get("plan") or self._base_plan).widened()
+        traced(
+            gained=len(fresh),
+            top_k=widened.top_k,
+            candidate_k=widened.candidate_k,
+            graph_hops=widened.graph_hops,
+        )
+        return {"plan": widened, "window_gain": fresh}
 
     async def _revise(self, state: ReviewState) -> dict[str, Any]:
         available = available_sources(state.get("sources", []), state.get("labels", []))
+        traced = self._step(trace_steps.REVIEW_REVISE, draft=state.get("draft", ""))
         answer, outcome = await run_revise(
             self._llm, state.get("draft", ""), available,
             state["report"], state.get("verdict"),
             config=state.get("llm_config"),
         )
+        traced(answer=answer, outcome=outcome)
         return {"answer": answer, "outcome": outcome}
 
     def _finalize(self, state: ReviewState) -> dict[str, Any]:
@@ -219,6 +281,14 @@ class ReviewRunner:
             critic_called=verdict is not None,
             cited=len(report.cited) if report else 0,
             fabricated=len(report.fabricated) if report else 0,
+        )
+        self._step(trace_steps.REVIEW_FINALIZE)(
+            answer=answer,
+            outcome=outcome,
+            rounds=state.get("rounds", 0),
+            sources=len(sources),
+            cited=sorted(report.cited) if report else [],
+            fabricated=sorted(report.fabricated) if report else [],
         )
         return {"answer": answer, "outcome": outcome, "sources": sources, "report": report}
 

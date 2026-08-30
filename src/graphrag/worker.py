@@ -19,6 +19,8 @@ from graphrag.core.redact import safe_detail
 from graphrag.ingestion.status import finalize_file
 from graphrag.jobs import JobStatus, JobStore
 from graphrag.pipelines import IngestPipeline
+from graphrag.trace import TraceStore
+from graphrag.trace.ingest import run_traced
 
 log = get_logger(__name__)
 
@@ -48,8 +50,16 @@ async def ingest_task(
         # was the one path that could write past the chunk ceiling. `shelf`
         # names the corpus; dropping it would file every worker-run ingest on
         # the user's default shelf regardless of where they uploaded it.
+        # Traced under the job id, which is how a worker-run ingest reaches
+        # the inspector page: the API process was never in the loop, so the
+        # steps have to travel through the shared store.
         stats = await asyncio.to_thread(
-            IngestPipeline(container, max_chunks=max_chunks).run, path, user_id, shelf
+            run_traced,
+            IngestPipeline(container, max_chunks=max_chunks),
+            path, user_id, shelf,
+            job_id=job_id,
+            settings=container.settings,
+            trace_store=ctx.get("traces"),
         )
         store.set(
             JobStatus(
@@ -85,6 +95,11 @@ async def startup(ctx: dict) -> None:
         )
     ctx["container"] = container
     ctx["jobs"] = JobStore(container.redis)
+    # Shares Redis with the API, which is the whole point: an ingest traced
+    # here has to be readable from the process serving /trace/{job_id}.
+    ctx["traces"] = TraceStore(
+        container.redis, ttl_seconds=container.settings.trace.ttl_seconds
+    )
     # Its own engine: the worker is a separate process, so it cannot share the
     # API's. Optional — without a database there is simply no file row to stamp.
     ctx["db"] = None
