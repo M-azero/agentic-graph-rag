@@ -7,6 +7,7 @@ import "./index.css";
 import { AuthProvider, RequireAuth } from "./lib/auth";
 import { ThemeProvider } from "./lib/theme";
 import ForgotPassword from "./routes/ForgotPassword";
+import Landing from "./routes/Landing";
 import Login from "./routes/Login";
 import ResetPassword from "./routes/ResetPassword";
 import Signup from "./routes/Signup";
@@ -49,7 +50,9 @@ const router = createBrowserRouter([
   { path: "/forgot-password", element: <ForgotPassword /> },
   { path: "/reset-password", element: <ResetPassword /> },
 
-  { path: "/", element: <Navigate to="/chat" replace /> },
+  // The page before sign-in: what this is, how to reach us, where the code
+  // lives. Public — a signed-in visitor sees "Open the app" instead.
+  { path: "/", element: <Landing /> },
   { path: "/chat", element: app(<Chat />) },
   // The same component for both: the thread id is a route param, so opening a
   // conversation is a navigation rather than a state change — which makes the

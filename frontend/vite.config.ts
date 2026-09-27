@@ -10,6 +10,13 @@ import react from "@vitejs/plugin-react";
 // (gitignored) .env rather than in tracked source.
 const APP_NAME = process.env.VITE_APP_NAME || "Graph RAG";
 
+// The landing page's links, from CONTACT_EMAIL / SOURCE_URL in .env for the same
+// reason: a deployment's contact address does not belong in a public repo.
+// No address hides the contact link; no source URL points at upstream.
+const CONTACT_EMAIL = process.env.VITE_CONTACT_EMAIL || "";
+const SOURCE_URL =
+  process.env.VITE_SOURCE_URL || "https://github.com/M-azero/agentic-graph-rag";
+
 // In dev, proxy /api -> the local backend and strip the /api prefix.
 export default defineConfig({
   plugins: [
@@ -25,7 +32,11 @@ export default defineConfig({
   ],
   // Inlined at build time so the components have no runtime lookup and no
   // undefined case. Declared in src/vite-env.d.ts.
-  define: { __APP_NAME__: JSON.stringify(APP_NAME) },
+  define: {
+    __APP_NAME__: JSON.stringify(APP_NAME),
+    __CONTACT_EMAIL__: JSON.stringify(CONTACT_EMAIL),
+    __SOURCE_URL__: JSON.stringify(SOURCE_URL),
+  },
   server: {
     port: 5173,
     proxy: {

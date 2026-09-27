@@ -96,7 +96,7 @@ function Notice({ title, detail }: { title: string; detail: string }) {
         <h1 className="font-display text-xl font-bold tracking-tight text-strong">{title}</h1>
         <p className="mt-2 text-sm text-muted">{detail}</p>
         <a
-          href="/"
+          href="/chat"
           className="mt-5 inline-flex items-center rounded-md bg-accent px-3 py-1.5 text-sm font-medium text-accent-text"
         >
           Back to the app

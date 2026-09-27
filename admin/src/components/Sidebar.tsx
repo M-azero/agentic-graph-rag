@@ -95,7 +95,7 @@ export function Sidebar() {
         {/* A plain anchor, not a Link: the chat app is a different bundle at a
             different root, so this has to be a full page load. */}
         <a
-          href="/"
+          href="/chat"
           className="flex items-center gap-2 rounded-md px-2.5 py-1.5 text-sm text-muted hover:bg-raised hover:text-body"
         >
           <ExternalLink className="h-3.5 w-3.5" />

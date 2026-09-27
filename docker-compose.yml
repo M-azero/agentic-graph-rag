@@ -217,6 +217,9 @@ services:
         # Baked into the two SPA bundles at build time, so changing it needs
         # `up -d --build proxy` — a recreate cannot change a built file.
         APP_NAME: ${APP_NAME:-Graph RAG}
+        # The landing page's contact link and source link. Empty contact hides it.
+        CONTACT_EMAIL: ${CONTACT_EMAIL:-}
+        SOURCE_URL: ${SOURCE_URL:-}
     restart: unless-stopped
     environment:
       SITE_ADDRESS: ${SITE_ADDRESS:-:80}   # -> localhost or a domain to enable HTTPS

@@ -14,6 +14,10 @@ WORKDIR /app
 # Set APP_NAME in .env; the default keeps a fork unbranded.
 ARG APP_NAME="Graph RAG"
 ENV VITE_APP_NAME=$APP_NAME
+# The landing page's contact address and source link (see .env.example).
+ARG CONTACT_EMAIL=""
+ARG SOURCE_URL=""
+ENV VITE_CONTACT_EMAIL=$CONTACT_EMAIL VITE_SOURCE_URL=$SOURCE_URL
 # Lockfile first, and `npm ci` rather than `npm install`: ci installs exactly
 # what the lockfile pins, so the image ships the tree that CI tested. With only
 # package.json, npm re-resolves every caret range at build time.
