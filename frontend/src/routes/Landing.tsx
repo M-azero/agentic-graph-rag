@@ -42,8 +42,8 @@ export default function Landing() {
             ) : (
               <>
                 <PillLink to="/login">Sign in</PillLink>
-                <PillLink to="/signup" primary className="hidden sm:inline-flex">
-                  Create an account
+                <PillLink to="/signup" primary>
+                  Sign up
                 </PillLink>
               </>
             )}
@@ -69,7 +69,7 @@ export default function Landing() {
               ) : (
                 <>
                   <PillLink to="/signup" primary large>
-                    Create an account
+                    Sign up
                   </PillLink>
                   <PillLink to="/login" large>
                     Sign in
