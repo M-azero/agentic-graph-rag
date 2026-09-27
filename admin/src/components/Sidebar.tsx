@@ -1,6 +1,5 @@
 import clsx from "clsx";
 import {
-  Activity,
   ExternalLink,
   LayoutDashboard,
   LogOut,
@@ -13,6 +12,8 @@ import {
   Users,
 } from "lucide-react";
 import { NavLink } from "react-router-dom";
+
+import { Logo } from "./ui";
 
 import { useAuth } from "../lib/auth";
 import { useTheme } from "../lib/theme";
@@ -34,7 +35,7 @@ const THEMES = [
 function ThemeToggle() {
   const { theme, setTheme } = useTheme();
   return (
-    <div className="flex rounded-md bg-raised p-0.5" role="radiogroup" aria-label="Colour theme">
+    <div className="flex rounded-full bg-raised p-0.5" role="radiogroup" aria-label="Colour theme">
       {THEMES.map(({ value, icon: Icon, label }) => (
         <button
           key={value}
@@ -44,8 +45,8 @@ function ThemeToggle() {
           title={label}
           onClick={() => setTheme(value)}
           className={clsx(
-            "flex-1 rounded p-1.5 transition-colors",
-            theme === value ? "bg-surface text-strong shadow-card" : "text-muted hover:text-body",
+            "flex-1 rounded-full p-1.5 transition-colors",
+            theme === value ? "bg-surface text-accent shadow-card" : "text-muted hover:text-body",
           )}
         >
           <Icon className="mx-auto h-3.5 w-3.5" />
@@ -59,12 +60,10 @@ export function Sidebar() {
   const { me, signOut } = useAuth();
 
   return (
-    <aside className="flex w-sidebar shrink-0 flex-col border-r border-border bg-surface">
+    <aside className="glass flex w-sidebar shrink-0 flex-col overflow-hidden rounded-xl">
       <div className="flex items-center gap-2 px-4 py-3.5">
-        <span className="flex h-6 w-6 items-center justify-center rounded-md bg-accent text-accent-text">
-          <Activity className="h-3.5 w-3.5" />
-        </span>
-        <span className="text-sm font-semibold tracking-tight text-strong">Admin</span>
+        <Logo className="h-6 w-6" />
+        <span className="font-display text-lg font-bold tracking-tight text-strong">Admin</span>
       </div>
 
       <nav className="flex-1 space-y-0.5 px-2 py-2">
@@ -76,7 +75,9 @@ export function Sidebar() {
             className={({ isActive }) =>
               clsx(
                 "flex items-center gap-2.5 rounded-md px-2.5 py-1.5 text-sm font-medium transition-colors",
-                isActive ? "bg-accent/10 text-accent" : "text-muted hover:bg-raised hover:text-body",
+                isActive
+                  ? "border-l-2 border-accent bg-accent/10 text-strong"
+                  : "border-l-2 border-transparent text-muted hover:bg-raised hover:text-body",
               )
             }
           >

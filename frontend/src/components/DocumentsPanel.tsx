@@ -181,7 +181,7 @@ export function DocumentsPanel({
   const atLimit = limit > 0 && used >= limit;
 
   return (
-    <aside className="flex w-80 shrink-0 flex-col border-l border-border bg-surface">
+    <aside className="glass flex w-80 shrink-0 flex-col overflow-hidden rounded-xl">
       <header className="flex h-12 items-center justify-between border-b border-border px-4">
         {/* Named, because an upload here lands on this shelf and nowhere else —
             the header is what makes that visible before the file is dropped. */}

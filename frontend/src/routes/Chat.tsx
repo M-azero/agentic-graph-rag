@@ -1,4 +1,4 @@
-import { FileText, PanelRightOpen } from "lucide-react";
+import { PanelRightOpen } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 
@@ -17,7 +17,7 @@ import { Composer } from "../components/chat/Composer";
 import { Message, type Turn } from "../components/chat/Message";
 import { QuotaBanner } from "../components/chat/QuotaBanner";
 import { ThreadSidebar } from "../components/chat/ThreadSidebar";
-import { Alert, Button, EmptyState } from "../components/ui";
+import { Alert, Button, EmptyState, Logo } from "../components/ui";
 import { useAuth } from "../lib/auth";
 
 const MODEL_KEY = "graphrag_model";
@@ -301,7 +301,7 @@ export default function Chat() {
   }
 
   return (
-    <div className="flex h-full">
+    <div className="flex h-full gap-3">
       <ThreadSidebar
         threads={threads}
         activeId={threadId ?? null}
@@ -329,7 +329,7 @@ export default function Chat() {
         onDelete={removeThread}
       />
 
-      <section className="flex min-w-0 flex-1 flex-col">
+      <section className="glass flex min-w-0 flex-1 flex-col overflow-hidden rounded-2xl">
         <div className="flex h-11 shrink-0 items-center justify-end px-4">
           {!showDocs && (
             <Button size="sm" variant="ghost" onClick={() => setShowDocs(true)}>
@@ -348,7 +348,7 @@ export default function Chat() {
 
             {turns.length === 0 && !quota && (
               <EmptyState
-                icon={<FileText className="h-6 w-6" />}
+                icon={<Logo className="h-12 w-12" />}
                 title={
                   activeShelf ? `Ask “${activeShelf.name}” anything` : "Ask your documents anything"
                 }

@@ -1,48 +1,76 @@
-@import "@fontsource-variable/inter";
+@import "@fontsource-variable/onest";
+@import "@fontsource-variable/syne";
 
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
-/* The same palette as the chat app, duplicated rather than shared — two
-   independent builds, one visual identity. Channels (not hex) so Tailwind's
-   <alpha-value> works and every colour can be used at partial opacity.
+/* Aurora over a knowledge graph. Two palettes, one set of names; channels
+   (not hex) so Tailwind's <alpha-value> works.
 
-   Near-neutral greys with a hairline border: the console is mostly tables, and
-   heavy rules between every row are what make an admin panel look like a
-   database viewer instead of a product. */
+   The colours are the real ones: oxygen green (557.7 nm) is the accent, and
+   nitrogen violet only ever appears in the sky itself, never on a control —
+   so anything green is something you can act on. Surfaces are glass: their
+   `-alpha` is how much sky shows through, and the sky is the one bold thing
+   on the page. Everything sitting on it stays quiet.
+
+   These values are duplicated in frontend/src/index.css. The two apps are
+   independent builds that must look like one product, so if you change a
+   channel here, change it there. */
 @layer base {
   :root {
-    --canvas: 252 252 251;
+    --canvas: 238 243 246;
     --surface: 255 255 255;
-    --raised: 246 246 245;
-    --border: 233 233 231;
-    --text-strong: 24 24 27;
-    --text-body: 63 63 70;
-    --text-muted: 130 130 138;
-    --accent: 79 70 229;
-    --accent-soft: 238 238 253;
+    --surface-alpha: 0.62;
+    --raised: 214 226 234;
+    --raised-alpha: 0.55;
+    --border: 12 27 42;
+    --border-alpha: 0.11;
+    --text-strong: 12 27 42;
+    --text-body: 46 64 84;
+    --text-muted: 98 116 136;
+    --accent: 11 122 99;
+    --accent-soft: 208 238 226;
     --accent-text: 255 255 255;
-    --positive: 22 143 96;
-    --caution: 191 129 20;
-    --danger: 205 58 58;
+    --positive: 21 128 84;
+    --caution: 168 104 8;
+    --danger: 196 50 62;
+    --aurora-a: 120 226 188;
+    --aurora-b: 140 196 244;
+    --aurora-c: 196 176 255;
+    --aurora-strength: 0.75;
+    --sheen: 0.7;
+    --shade: 40 70 100;
+    --stars: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='600' height='420' viewBox='0 0 600 420'><g stroke='%230c1b2a' stroke-opacity='0.35' stroke-width='0.8' fill='none'><line x1='40' y1='70' x2='170' y2='34'/><line x1='170' y1='34' x2='262' y2='142'/><line x1='262' y1='142' x2='118' y2='210'/><line x1='40' y1='70' x2='118' y2='210'/><line x1='262' y1='142' x2='360' y2='64'/><line x1='360' y1='64' x2='476' y2='158'/><line x1='476' y1='158' x2='424' y2='300'/><line x1='424' y1='300' x2='252' y2='336'/><line x1='252' y1='336' x2='118' y2='210'/><line x1='252' y1='336' x2='84' y2='364'/><line x1='360' y1='64' x2='528' y2='40'/><line x1='476' y1='158' x2='560' y2='262'/><line x1='424' y1='300' x2='560' y2='262'/><line x1='262' y1='142' x2='252' y2='336'/></g><g fill='%230c1b2a'><circle cx='40' cy='70' r='3'/><circle cx='40' cy='70' r='9' fill-opacity='0.12'/><circle cx='170' cy='34' r='2'/><circle cx='262' cy='142' r='3.5'/><circle cx='262' cy='142' r='10.5' fill-opacity='0.12'/><circle cx='118' cy='210' r='2'/><circle cx='360' cy='64' r='2.5'/><circle cx='476' cy='158' r='3'/><circle cx='476' cy='158' r='9' fill-opacity='0.12'/><circle cx='424' cy='300' r='2'/><circle cx='252' cy='336' r='2.5'/><circle cx='84' cy='364' r='2'/><circle cx='528' cy='40' r='2'/><circle cx='560' cy='262' r='2.5'/></g></svg>");
+    --stars-opacity: 0.35;
     color-scheme: light;
   }
 
   :root.dark {
-    --canvas: 12 12 14;
-    --surface: 18 18 21;
-    --raised: 26 26 30;
-    --border: 38 38 43;
-    --text-strong: 243 243 245;
-    --text-body: 198 198 205;
-    --text-muted: 132 132 141;
-    --accent: 129 122 245;
-    --accent-soft: 39 38 66;
-    --accent-text: 12 12 20;
-    --positive: 60 190 133;
-    --caution: 226 172 63;
-    --danger: 240 112 112;
+    --canvas: 8 18 38;
+    --surface: 18 34 62;
+    --surface-alpha: 0.5;
+    --raised: 60 86 128;
+    --raised-alpha: 0.28;
+    --border: 170 200 240;
+    --border-alpha: 0.12;
+    --text-strong: 236 244 250;
+    --text-body: 192 206 224;
+    --text-muted: 128 148 176;
+    --accent: 110 240 184;
+    --accent-soft: 24 70 70;
+    --accent-text: 5 28 30;
+    --positive: 88 222 156;
+    --caution: 244 192 96;
+    --danger: 255 124 136;
+    --aurora-a: 64 214 160;
+    --aurora-b: 40 150 200;
+    --aurora-c: 124 92 240;
+    --aurora-strength: 0.55;
+    --sheen: 0.08;
+    --shade: 0 4 16;
+    --stars: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='600' height='420' viewBox='0 0 600 420'><g stroke='%23dff7ff' stroke-opacity='0.35' stroke-width='0.8' fill='none'><line x1='40' y1='70' x2='170' y2='34'/><line x1='170' y1='34' x2='262' y2='142'/><line x1='262' y1='142' x2='118' y2='210'/><line x1='40' y1='70' x2='118' y2='210'/><line x1='262' y1='142' x2='360' y2='64'/><line x1='360' y1='64' x2='476' y2='158'/><line x1='476' y1='158' x2='424' y2='300'/><line x1='424' y1='300' x2='252' y2='336'/><line x1='252' y1='336' x2='118' y2='210'/><line x1='252' y1='336' x2='84' y2='364'/><line x1='360' y1='64' x2='528' y2='40'/><line x1='476' y1='158' x2='560' y2='262'/><line x1='424' y1='300' x2='560' y2='262'/><line x1='262' y1='142' x2='252' y2='336'/></g><g fill='%23dff7ff'><circle cx='40' cy='70' r='3'/><circle cx='40' cy='70' r='9' fill-opacity='0.12'/><circle cx='170' cy='34' r='2'/><circle cx='262' cy='142' r='3.5'/><circle cx='262' cy='142' r='10.5' fill-opacity='0.12'/><circle cx='118' cy='210' r='2'/><circle cx='360' cy='64' r='2.5'/><circle cx='476' cy='158' r='3'/><circle cx='476' cy='158' r='9' fill-opacity='0.12'/><circle cx='424' cy='300' r='2'/><circle cx='252' cy='336' r='2.5'/><circle cx='84' cy='364' r='2'/><circle cx='528' cy='40' r='2'/><circle cx='560' cy='262' r='2.5'/></g></svg>");
+    --stars-opacity: 0.55;
     color-scheme: dark;
   }
 
@@ -52,9 +80,57 @@
     height: 100%;
   }
 
+  html {
+    background: rgb(var(--canvas));
+  }
+
   body {
-    @apply bg-canvas text-body antialiased;
-    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+    @apply text-body antialiased;
+  }
+
+  /* The sky. Two fixed layers behind the app: aurora curtains that drift very
+     slowly, and a constellation of nodes and edges — the graph this product is
+     built on, drawn faintly into the night. It is the only decoration on the
+     page, and the only motion nobody asked for. */
+  body::before,
+  body::after {
+    content: "";
+    position: fixed;
+    pointer-events: none;
+    z-index: 0;
+  }
+  body::before {
+    inset: -25%;
+    opacity: var(--aurora-strength);
+    background:
+      radial-gradient(38% 26% at 22% 18%, rgb(var(--aurora-a) / 0.9), transparent 70%),
+      radial-gradient(30% 40% at 78% 12%, rgb(var(--aurora-b) / 0.7), transparent 70%),
+      radial-gradient(26% 22% at 64% 30%, rgb(var(--aurora-c) / 0.55), transparent 70%),
+      radial-gradient(40% 30% at 30% 92%, rgb(var(--aurora-b) / 0.35), transparent 70%);
+    filter: blur(64px) saturate(130%);
+    animation: drift 48s ease-in-out infinite alternate;
+  }
+  body::after {
+    inset: 0;
+    opacity: var(--stars-opacity);
+    background-image: var(--stars);
+    background-size: 600px 420px;
+    -webkit-mask-image: radial-gradient(120% 90% at 70% 0%, #000 20%, transparent 75%);
+    mask-image: radial-gradient(120% 90% at 70% 0%, #000 20%, transparent 75%);
+  }
+  #root {
+    position: relative;
+    z-index: 1;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    body::before {
+      animation: none;
+    }
+  }
+
+  h1, h2, h3 {
+    text-wrap: balance;
   }
 
   /* Every number in a console sits in a column next to another number.
@@ -74,7 +150,7 @@
 
   * {
     scrollbar-width: thin;
-    scrollbar-color: rgb(var(--border)) transparent;
+    scrollbar-color: rgb(var(--border) / 0.25) transparent;
   }
   ::-webkit-scrollbar {
     width: 10px;
@@ -82,7 +158,7 @@
   }
   ::-webkit-scrollbar-thumb {
     @apply rounded-full border-4 border-solid border-transparent bg-clip-padding;
-    background-color: rgb(var(--border));
+    background-color: rgb(var(--border) / 0.25);
   }
   ::-webkit-scrollbar-track {
     background: transparent;
@@ -90,9 +166,28 @@
 }
 
 @layer components {
+  /* A frosted pane. Its own edge instead of the hairline token, because an edge
+     on glass is light catching it, not a line drawn around it. */
+  .glass {
+    background-color: rgb(var(--surface) / var(--surface-alpha));
+    border: 1px solid rgb(var(--border) / 0.1);
+    -webkit-backdrop-filter: blur(22px) saturate(160%);
+    backdrop-filter: blur(22px) saturate(160%);
+    @apply shadow-card;
+  }
+  .glass-pop {
+    background-color: rgb(var(--surface) / calc(var(--surface-alpha) + 0.3));
+    border: 1px solid rgb(var(--border) / 0.12);
+    -webkit-backdrop-filter: blur(28px) saturate(170%);
+    backdrop-filter: blur(28px) saturate(170%);
+    @apply shadow-pop;
+  }
+}
+
+@layer components {
   /* The section label above a stat rail or a table: small, wide-tracked and
      quiet, so it groups without competing with the data. */
   .eyebrow {
-    @apply text-2xs font-medium uppercase tracking-wider text-muted;
+    @apply text-xs font-medium text-muted;
   }
 }

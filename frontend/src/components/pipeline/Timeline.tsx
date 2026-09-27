@@ -33,7 +33,7 @@ export function Timeline({
   );
 
   return (
-    <section className="rounded-lg border border-border bg-surface p-4">
+    <section className="glass rounded-xl p-4">
       <h2 className="mb-3 text-sm font-semibold text-strong">
         Timeline
         <span className="ml-2 font-normal text-muted">

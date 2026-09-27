@@ -28,7 +28,7 @@ export function Sources({ sources }: { sources: Source[] }) {
           {sources.map((s) => (
             <li
               key={s.chunk_id}
-              className="rounded-lg border border-border bg-raised/60 p-2.5"
+              className="rounded-lg border border-border border-l-2 border-l-accent/60 bg-raised p-2.5"
             >
               <div className="mb-1 flex items-center gap-2">
                 <FileText className="h-3 w-3 shrink-0 text-muted" />

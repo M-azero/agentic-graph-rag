@@ -114,7 +114,7 @@ export function ShelfPicker({
       {open && (
         <div
           role="listbox"
-          className="absolute left-0 right-0 top-full z-30 mt-1 overflow-hidden rounded-lg border border-border bg-surface shadow-pop"
+          className="glass-pop absolute left-0 right-0 top-full z-30 mt-1 overflow-hidden rounded-lg"
         >
           <ul className="max-h-64 overflow-y-auto py-1">
             {shelves.map((shelf) => {

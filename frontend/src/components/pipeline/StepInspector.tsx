@@ -21,7 +21,7 @@ export function StepInspector({ node, run }: Props) {
 
   if (!node) {
     return (
-      <aside className="rounded-lg border border-border bg-surface p-4">
+      <aside className="glass rounded-xl p-4">
         <p className="text-sm text-muted">
           Pick a block in the diagram to see what it received and what it returned.
         </p>
@@ -33,7 +33,7 @@ export function StepInspector({ node, run }: Props) {
   const step = steps[Math.min(index, steps.length - 1)];
 
   return (
-    <aside className="flex flex-col gap-3 rounded-lg border border-border bg-surface p-4">
+    <aside className="glass flex flex-col gap-3 rounded-xl p-4">
       <header>
         <h2 className="text-base font-semibold text-strong">{node.label}</h2>
         <p className="mt-1 text-sm text-body">{node.summary}</p>
@@ -112,7 +112,7 @@ function Payload({ title, values }: { title: string; values: Record<string, unkn
   if (entries.length === 0) return null;
   return (
     <section>
-      <h3 className="mb-1.5 text-2xs font-semibold uppercase tracking-wide text-muted">
+      <h3 className="mb-1.5 text-xs font-semibold text-muted">
         {title}
       </h3>
       <dl className="flex flex-col gap-1.5">

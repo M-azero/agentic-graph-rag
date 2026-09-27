@@ -89,7 +89,7 @@ export function DataTable<T>({
                 key={c.key}
                 scope="col"
                 className={clsx(
-                  "whitespace-nowrap px-3 py-2 text-2xs font-medium uppercase tracking-wider text-muted",
+                  "whitespace-nowrap px-3 py-2 text-xs font-medium text-muted",
                   c.align === "right" ? "text-right" : "text-left",
                 )}
               >

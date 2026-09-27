@@ -59,7 +59,7 @@ export function Composer({
       {/* A border rather than a ring, and it thickens to the accent on focus.
           Sitting on the canvas with no bar behind it, the input reads as part
           of the conversation rather than a toolbar bolted to the bottom. */}
-      <div className="rounded-xl border border-border bg-surface shadow-card transition-colors focus-within:border-accent">
+      <div className="rounded-xl border border-border bg-surface shadow-card transition-shadow focus-within:border-accent/50 focus-within:shadow-glow">
         <textarea
           ref={ref}
           value={value}
@@ -77,7 +77,7 @@ export function Composer({
             onChange={(e) => onPresetChange(e.target.value)}
             aria-label="Mode"
             title={presets.find((p) => p.id === preset)?.description}
-            className="h-7 !w-auto py-0 text-xs"
+            className="h-7 !w-auto rounded-full py-0 text-xs"
           >
             {presets.map((p) => (
               <option key={p.id} value={p.id}>
@@ -91,7 +91,7 @@ export function Composer({
               value={model}
               onChange={(e) => onModelChange(e.target.value)}
               aria-label="Model"
-              className="h-7 !w-auto py-0 text-xs"
+              className="h-7 !w-auto rounded-full py-0 text-xs"
             >
               {models.map((m) => (
                 <option key={m.model} value={m.model}>

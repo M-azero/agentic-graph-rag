@@ -83,7 +83,7 @@ export default function Account() {
     <div className="h-full overflow-y-auto">
       <div className="mx-auto max-w-3xl space-y-4 px-4 py-8">
         <div>
-          <h1 className="text-lg font-semibold tracking-tight text-strong">Account</h1>
+          <h1 className="font-display text-2xl font-bold tracking-tight text-strong">Account</h1>
           <p className="mt-1 text-sm text-muted">{me?.email}</p>
         </div>
 

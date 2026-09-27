@@ -14,11 +14,11 @@ export function Stat({
   tone?: "positive" | "caution" | "danger";
 }) {
   return (
-    <div className="rounded-lg border border-border bg-surface px-4 py-3 shadow-card">
+    <div className="glass rounded-xl px-4 py-3">
       <p className="eyebrow">{label}</p>
       <p
         className={clsx(
-          "mt-1 text-2xl font-semibold tabular-nums",
+          "mt-1 font-display text-2xl font-bold tabular-nums",
           tone === "positive" && "text-positive",
           tone === "caution" && "text-caution",
           tone === "danger" && "text-danger",

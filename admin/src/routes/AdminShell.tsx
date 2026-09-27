@@ -27,13 +27,15 @@ export function AdminShell() {
   const { pathname } = useLocation();
 
   return (
-    <div className="flex h-full bg-canvas">
+    <div className="flex h-full gap-3 p-3">
       <Sidebar />
       <div className="flex min-w-0 flex-1 flex-col">
-        <header className="flex h-12 shrink-0 items-center border-b border-border px-5">
-          <h1 className="text-sm font-semibold text-strong">{titleFor(pathname)}</h1>
+        <header className="flex h-14 shrink-0 items-center px-5">
+          <h1 className="font-display text-2xl font-bold tracking-tight text-strong">
+            {titleFor(pathname)}
+          </h1>
         </header>
-        <main className="min-h-0 flex-1 overflow-y-auto p-5">
+        <main className="min-h-0 flex-1 overflow-y-auto px-5 pb-5">
           <Outlet />
         </main>
       </div>

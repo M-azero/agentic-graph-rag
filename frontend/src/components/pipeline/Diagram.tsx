@@ -24,11 +24,11 @@ import {
 const STATE_CLASS: Record<NodeState, string> = {
   // Dashed: this block has not been reached yet. The distinction from `skipped`
   // matters — one is "not yet", the other is "ran and had nothing to do".
-  idle: "fill-surface stroke-border [stroke-dasharray:4_3]",
+  idle: "fill-surface stroke-muted/50 [stroke-dasharray:4_3]",
   running: "fill-accent-soft stroke-accent",
   ok: "fill-surface stroke-positive",
   error: "fill-surface stroke-danger",
-  skipped: "fill-raised stroke-border",
+  skipped: "fill-raised stroke-muted/40",
 };
 
 const LABEL_CLASS: Record<NodeState, string> = {
@@ -56,7 +56,7 @@ export function Diagram({ graph, runs, selected, onSelect }: Props) {
     // The wide diagram scrolls inside its own box; the page never scrolls
     // sideways. `max-h` keeps a tall pipeline from pushing the panels below it
     // off-screen — it scrolls vertically inside the box instead.
-    <div className="max-h-[70vh] overflow-auto rounded-lg border border-border bg-canvas p-4">
+    <div className="max-h-[70vh] overflow-auto rounded-lg border border-border bg-canvas/40 p-4">
       <svg
         viewBox={`-8 -28 ${width + 16} ${height + 36}`}
         // BOTH dimensions as attributes, 1:1 with the viewBox. Setting only
@@ -80,7 +80,7 @@ export function Diagram({ graph, runs, selected, onSelect }: Props) {
             markerHeight="5"
             orient="auto-start-reverse"
           >
-            <path d="M0,1 L7,4 L0,7 z" className="fill-border" />
+            <path d="M0,1 L7,4 L0,7 z" className="fill-muted/60" />
           </marker>
         </defs>
 
@@ -89,7 +89,7 @@ export function Diagram({ graph, runs, selected, onSelect }: Props) {
             key={lane.row}
             x={-4}
             y={lane.row * 92 - 8}
-            className="fill-muted text-[10px] uppercase tracking-wide"
+            className="fill-muted text-[11px] font-medium"
           >
             {lane.label}
           </text>
@@ -104,7 +104,7 @@ export function Diagram({ graph, runs, selected, onSelect }: Props) {
               key={`${edge.from}->${edge.to}`}
               d={edgePath(from, to)}
               className={clsx(
-                "fill-none stroke-border",
+                "fill-none stroke-muted/45",
                 // An edge into a block that ran is drawn solid; the rest of the
                 // graph stays visible but recedes.
                 runs[edge.to] ? "opacity-100" : "opacity-40",
@@ -204,7 +204,7 @@ function Node({
       </text>
       {count > 1 && (
         <>
-          <circle cx={NODE_W - 16} cy={18} r={9} className="fill-raised stroke-border" />
+          <circle cx={NODE_W - 16} cy={18} r={9} className="fill-raised stroke-muted/40" />
           <text
             x={NODE_W - 16}
             y={21.5}

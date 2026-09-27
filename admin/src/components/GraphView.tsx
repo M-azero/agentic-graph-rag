@@ -84,7 +84,7 @@ export function GraphView({ sample }: { sample: GraphSample }) {
               y1={s.y}
               x2={t.x}
               y2={t.y}
-              stroke="rgb(var(--border))"
+              stroke="rgb(var(--border) / 0.2)"
               strokeWidth={1}
             />
           );

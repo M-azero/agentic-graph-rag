@@ -92,8 +92,8 @@ export function AuthGate({ children }: { children: ReactNode }) {
 function Notice({ title, detail }: { title: string; detail: string }) {
   return (
     <div className="flex h-full items-center justify-center p-6">
-      <div className="max-w-sm rounded-lg border border-border bg-surface p-6 text-center shadow-card">
-        <h1 className="text-lg font-semibold text-strong">{title}</h1>
+      <div className="glass max-w-sm rounded-2xl p-6 text-center">
+        <h1 className="font-display text-xl font-bold tracking-tight text-strong">{title}</h1>
         <p className="mt-2 text-sm text-muted">{detail}</p>
         <a
           href="/"

@@ -150,10 +150,10 @@ export default function Pipeline() {
     <div className="mx-auto flex h-full max-w-[1400px] flex-col gap-4 overflow-y-auto p-4">
       <header className="flex flex-wrap items-end justify-between gap-3">
         <div>
-          <h1 className="text-xl font-semibold text-strong">Pipeline inspector</h1>
+          <h1 className="font-display text-2xl font-bold tracking-tight text-strong">Pipeline inspector</h1>
           <p className="mt-1 max-w-2xl text-sm text-muted">{BLURBS[pipeline]}</p>
         </div>
-        <nav className="flex rounded-md bg-raised p-0.5" role="tablist">
+        <nav className="flex rounded-full bg-raised p-0.5" role="tablist">
           {graphs.map((g) => (
             <button
               key={g.pipeline}
@@ -165,8 +165,8 @@ export default function Pipeline() {
               }}
               className={
                 pipeline === g.pipeline
-                  ? "rounded px-3 py-1.5 text-sm font-medium bg-surface text-strong shadow-card"
-                  : "rounded px-3 py-1.5 text-sm font-medium text-muted hover:text-body"
+                  ? "rounded-full px-3.5 py-1.5 text-sm font-medium bg-surface text-strong shadow-card"
+                  : "rounded-full px-3.5 py-1.5 text-sm font-medium text-muted hover:text-body"
               }
             >
               {TITLES[g.pipeline] ?? g.pipeline}
@@ -178,7 +178,7 @@ export default function Pipeline() {
       {error && <Alert tone="danger">{error}</Alert>}
 
       {pipeline === "ingest" ? (
-        <p className="rounded-lg border border-border bg-surface p-3 text-sm text-muted">
+        <p className="glass rounded-xl p-3 text-sm text-muted">
           Ingest runs happen in the background, so they are read back rather than
           streamed. Upload a document in Chat, then pick its run below — the job
           id is the run id.
@@ -235,7 +235,7 @@ export default function Pipeline() {
 
       {graph ? (
         <>
-          <section className="flex flex-col gap-2">
+          <section className="glass flex flex-col gap-2 rounded-xl p-4">
             <h2 className="text-sm font-semibold text-strong">Diagram</h2>
             <Diagram
               graph={graph}
@@ -277,7 +277,7 @@ export default function Pipeline() {
 
 function AnswerCard({ answer }: { answer: TraceAnswer }) {
   return (
-    <section className="rounded-lg border border-border bg-surface p-4">
+    <section className="glass rounded-xl p-4">
       <h2 className="mb-2 text-sm font-semibold text-strong">
         Answer
         <span className="ml-2 font-normal text-muted">{answer.outcome}</span>
@@ -315,7 +315,7 @@ function RunList({
   onRefresh: () => void;
 }) {
   return (
-    <section className="rounded-lg border border-border bg-surface p-4">
+    <section className="glass rounded-xl p-4">
       <div className="mb-2 flex items-center justify-between">
         <h2 className="text-sm font-semibold text-strong">Recent runs</h2>
         <Button size="sm" variant="ghost" onClick={onRefresh}>

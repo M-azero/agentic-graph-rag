@@ -60,7 +60,7 @@ export function ThreadSidebar({
   const groups = useMemo(() => group(threads), [threads]);
 
   return (
-    <aside className="flex w-64 shrink-0 flex-col border-r border-border bg-surface">
+    <aside className="glass flex w-64 shrink-0 flex-col overflow-hidden rounded-xl">
       {header && <div className="border-b border-border p-2">{header}</div>}
       <div className="min-h-0 flex-1 overflow-y-auto px-2 py-3">
         {loading ? (
@@ -76,7 +76,7 @@ export function ThreadSidebar({
         ) : (
           groups.map(({ label, items }) => (
             <section key={label} className="mb-4 last:mb-0">
-              <h2 className="px-2 pb-1 text-2xs font-medium uppercase tracking-wider text-muted">
+              <h2 className="px-2 pb-1 text-xs font-medium text-muted">
                 {label}
               </h2>
               <ul className="space-y-px">
@@ -85,10 +85,10 @@ export function ThreadSidebar({
                     <button
                       onClick={() => onSelect(thread.id)}
                       className={clsx(
-                        "w-full truncate rounded-md py-1.5 pl-2 pr-8 text-left text-sm transition-colors",
+                        "w-full truncate rounded-md border-l-2 py-1.5 pl-2 pr-8 text-left text-sm transition-colors",
                         thread.id === activeId
-                          ? "bg-raised font-medium text-strong"
-                          : "text-body hover:bg-raised/60",
+                          ? "border-accent bg-accent/10 font-medium text-strong"
+                          : "border-transparent text-body hover:bg-raised",
                       )}
                       title={thread.title}
                     >

@@ -88,7 +88,7 @@ export default function Overview() {
                     <stop offset="100%" stopColor="rgb(var(--accent))" stopOpacity={0} />
                   </linearGradient>
                 </defs>
-                <CartesianGrid stroke="rgb(var(--border))" strokeDasharray="3 3" vertical={false} />
+                <CartesianGrid stroke="rgb(var(--border) / 0.2)" strokeDasharray="3 3" vertical={false} />
                 <XAxis
                   dataKey="bucket"
                   tickFormatter={shortDate}
@@ -105,7 +105,7 @@ export default function Overview() {
                 <Tooltip
                   contentStyle={{
                     background: "rgb(var(--surface))",
-                    border: "1px solid rgb(var(--border))",
+                    border: "1px solid rgb(var(--border) / 0.2)",
                     borderRadius: 8,
                     fontSize: 12,
                   }}

@@ -10,11 +10,12 @@ import {
   type ReactNode,
   type SelectHTMLAttributes,
 } from "react";
+import { createPortal } from "react-dom";
 
 type Variant = "primary" | "secondary" | "ghost" | "danger";
 
 const VARIANTS: Record<Variant, string> = {
-  primary: "bg-accent text-accent-text hover:opacity-90",
+  primary: "bg-accent text-accent-text shadow-glow hover:brightness-110",
   secondary: "border border-border bg-surface text-body hover:bg-raised",
   ghost: "text-muted hover:bg-raised hover:text-body",
   // Destructive actions are outlined rather than filled: a solid red button is
@@ -113,7 +114,7 @@ export function Card({
   return (
     <section
       className={clsx(
-        "rounded-lg border border-border bg-surface shadow-card",
+        "glass rounded-xl",
         className,
       )}
     >
@@ -200,17 +201,20 @@ export function Modal({
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
 
-  return (
+  // Portaled to <body>: a glass pane (backdrop-filter) is the containing block
+  // for fixed descendants, so a modal opened from inside a card would otherwise
+  // be trapped inside that card.
+  return createPortal(
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-      <div className="absolute inset-0 bg-black/40" onClick={onClose} />
+      <div className="absolute inset-0 bg-canvas/40 backdrop-blur-sm" onClick={onClose} />
       <div
         role="dialog"
         aria-modal="true"
         aria-label={title}
-        className="relative z-10 w-full max-w-md rounded-lg border border-border bg-surface shadow-pop animate-slide-up"
+        className="glass-pop relative z-10 w-full max-w-md rounded-2xl animate-slide-up"
       >
         <header className="flex items-center justify-between border-b border-border px-4 py-2.5">
-          <h2 className="text-sm font-semibold text-strong">{title}</h2>
+          <h2 className="font-display text-base font-semibold tracking-tight text-strong">{title}</h2>
           <button
             onClick={onClose}
             aria-label="Close"
@@ -221,7 +225,8 @@ export function Modal({
         </header>
         <div className="p-4">{children}</div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }
 
@@ -249,4 +254,25 @@ export function compactNumber(value: number): string {
     notation: "compact",
     maximumFractionDigits: 1,
   }).format(value);
+}
+
+/** The mark: three nodes and the edges between them — the same one the chat
+ *  app wears, so the console reads as the same product. */
+export function Logo({ className }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 24 24" className={clsx("text-accent", className ?? "h-6 w-6")} aria-hidden>
+      <path
+        d="M5 17 L12 5 L19 15 Z"
+        fill="currentColor"
+        fillOpacity="0.12"
+        stroke="currentColor"
+        strokeOpacity="0.55"
+        strokeWidth="1.3"
+        strokeLinejoin="round"
+      />
+      <circle cx="12" cy="5" r="2.6" fill="currentColor" />
+      <circle cx="5" cy="17" r="2.1" fill="currentColor" fillOpacity="0.8" />
+      <circle cx="19" cy="15" r="1.7" fill="currentColor" fillOpacity="0.65" />
+    </svg>
+  );
 }

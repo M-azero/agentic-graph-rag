@@ -1,8 +1,7 @@
 import clsx from "clsx";
-import { ShieldAlert, Sparkles } from "lucide-react";
+import { ShieldAlert } from "lucide-react";
 
 import type { SafetyInfo, Source } from "../../api";
-import { Spinner } from "../ui";
 import { Markdown } from "./Markdown";
 import { Sources } from "./Sources";
 
@@ -62,7 +61,7 @@ export function Message({ turn }: { turn: Turn }) {
   if (isUser) {
     return (
       <div className="flex justify-end">
-        <div className="max-w-[85%] rounded-xl rounded-br-sm bg-accent px-3.5 py-2.5 text-base leading-relaxed text-accent-text">
+        <div className="max-w-[85%] rounded-xl rounded-br-md border border-accent/25 bg-accent-soft/80 px-4 py-2.5 text-base leading-relaxed text-strong">
           <p className="whitespace-pre-wrap">{turn.content}</p>
         </div>
       </div>
@@ -73,14 +72,20 @@ export function Message({ turn }: { turn: Turn }) {
 
   return (
     <div className="flex gap-3">
-      <span className="mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-raised text-muted">
-        <Sparkles className="h-3.5 w-3.5" />
+      {/* A single lit node rather than a sparkle: the answer is read off the
+          graph, and while it's being read the node pulses. */}
+      <span className="mt-1.5 flex h-4 w-4 shrink-0 items-center justify-center" aria-hidden>
+        <span
+          className={clsx(
+            "h-2.5 w-2.5 rounded-full bg-accent shadow-glow",
+            waiting && "animate-pulse",
+          )}
+        />
       </span>
 
       <div className="min-w-0 flex-1">
         {waiting && (
           <div className="flex items-center gap-2 text-sm text-muted">
-            <Spinner className="h-3 w-3" />
             <span>
               {turn.activity
                 ? (TOOL_LABELS[turn.activity] ?? "Working")

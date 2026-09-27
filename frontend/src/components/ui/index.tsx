@@ -11,6 +11,7 @@ import {
   type SelectHTMLAttributes,
   type TextareaHTMLAttributes,
 } from "react";
+import { createPortal } from "react-dom";
 
 type Variant = "primary" | "secondary" | "ghost" | "danger";
 type Size = "sm" | "md";
@@ -19,10 +20,10 @@ type Size = "sm" | "md";
 // row of ringed controls sits on a halo of doubled lines; a border is part of
 // the box and lines up with the hairlines everywhere else.
 const VARIANTS: Record<Variant, string> = {
-  primary: "bg-accent text-accent-text hover:opacity-90 active:opacity-100",
-  secondary: "bg-surface text-body border border-border hover:bg-raised active:bg-raised",
+  primary: "bg-accent text-accent-text shadow-glow hover:brightness-110 active:brightness-100",
+  secondary: "bg-surface text-body border border-border hover:bg-raised hover:text-strong active:bg-raised",
   ghost: "text-muted hover:bg-raised hover:text-body",
-  danger: "bg-danger text-white hover:opacity-90",
+  danger: "bg-danger text-white hover:brightness-110",
 };
 
 const SIZES: Record<Size, string> = {
@@ -139,7 +140,7 @@ export function Card({
   return (
     <div
       className={clsx(
-        "rounded-xl border border-border bg-surface",
+        "glass rounded-xl",
         padded && "p-5",
         className,
       )}
@@ -195,8 +196,8 @@ export function EmptyState({
   return (
     <div className="flex flex-col items-center justify-center px-6 py-14 text-center">
       {icon && <div className="mb-3 text-muted">{icon}</div>}
-      <p className="text-sm font-medium text-strong">{title}</p>
-      {description && <p className="mt-1 max-w-sm text-sm text-muted">{description}</p>}
+      <p className="font-display text-xl font-semibold tracking-tight text-strong">{title}</p>
+      {description && <p className="mt-2 max-w-sm text-sm text-muted">{description}</p>}
       {action && <div className="mt-4">{action}</div>}
     </div>
   );
@@ -277,21 +278,57 @@ export function Modal({
   onClose: () => void;
 }) {
   if (!open) return null;
-  return (
+  // Portaled to <body>: a glass pane (backdrop-filter) becomes the containing
+  // block for fixed descendants, so a modal rendered inside the sidebar would
+  // otherwise be trapped inside the sidebar.
+  return createPortal(
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4 animate-fade-in"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-canvas/40 p-4 backdrop-blur-sm animate-fade-in"
       onClick={onClose}
     >
       <div
         role="dialog"
         aria-modal
         aria-label={title}
-        className="w-full max-w-md rounded-xl bg-surface p-5 border border-border shadow-pop animate-slide-up"
+        className="glass-pop w-full max-w-md rounded-2xl p-6 animate-slide-up"
         onClick={(e) => e.stopPropagation()}
       >
-        <h2 className="mb-4 text-sm font-semibold text-strong">{title}</h2>
+        <h2 className="mb-4 font-display text-lg font-semibold tracking-tight text-strong">{title}</h2>
         {children}
       </div>
-    </div>
+    </div>,
+    document.body,
+  );
+}
+
+/** The mark: three nodes and the edges between them — a graph, which is what
+ *  every answer here is read from. Drawn rather than an icon-in-a-square. */
+export function Logo({ className }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 24 24" className={clsx("text-accent", className ?? "h-6 w-6")} aria-hidden>
+      <path
+        d="M5 17 L12 5 L19 15 Z"
+        fill="currentColor"
+        fillOpacity="0.12"
+        stroke="currentColor"
+        strokeOpacity="0.55"
+        strokeWidth="1.3"
+        strokeLinejoin="round"
+      />
+      <circle cx="12" cy="5" r="2.6" fill="currentColor" />
+      <circle cx="5" cy="17" r="2.1" fill="currentColor" fillOpacity="0.8" />
+      <circle cx="19" cy="15" r="1.7" fill="currentColor" fillOpacity="0.65" />
+    </svg>
+  );
+}
+
+export function Wordmark({ className }: { className?: string }) {
+  return (
+    <span className={clsx("flex items-center gap-2", className)}>
+      <Logo className="h-6 w-6" />
+      <span className="font-display text-lg font-bold tracking-tight text-strong">
+        {__APP_NAME__}
+      </span>
+    </span>
   );
 }
