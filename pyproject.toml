@@ -33,7 +33,7 @@ dependencies = [
   "langgraph-checkpoint-postgres>=3.1",
   "langgraph-checkpoint-redis>=0.5",
   # --- agent / llm framework ---
-  "langgraph>=1.2",
+  "langgraph>=1.2,<2",  # create_react_agent is removed in 2.0 (agent/graph.py)
   "langchain-core>=0.3",
   "langchain-text-splitters>=0.3",
   # --- providers (installed together for simplicity; swap freely via config) ---

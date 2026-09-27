@@ -160,9 +160,21 @@ def test_noop_reranker_is_never_treated_as_calibrated(make_chunk):
     assert out[0].metadata[rr.CALIBRATED] is False
 
 
-def test_generative_scores_are_calibrated(build, make_chunk):
+def test_generative_scores_are_never_calibrated(build, make_chunk):
+    """A working generative rerank is still the wrong scale.
+
+    This is the subtle one, and it used to assert the opposite. A failed
+    generative rerank is obviously uncalibrated; a SUCCESSFUL one returns an
+    integer 0-10 mapped onto 0-1, which looks exactly like a relevance score and
+    is not one. Measured on identical candidates, Cohere and the generative
+    fallback scored the same question 0.6598 and 0.1000 — opposite verdicts
+    against `min_relevance: 0.5`. So the gate must suspend rather than compare,
+    the same as for a no-op, and the flag is what tells it to.
+    """
     out = build({"x": "8"}).rerank("q", [make_chunk("c1", "x")], top_k=1)
-    assert out[0].metadata[rr.CALIBRATED] is True
+    assert out[0].metadata[rr.CALIBRATED] is False
+    # Ordering is unaffected — only the refuse/answer decision steps aside.
+    assert out[0].score == 0.8
 
 
 def test_generative_reranker_that_scores_nothing_is_uncalibrated(build, make_chunk):
@@ -170,3 +182,27 @@ def test_generative_reranker_that_scores_nothing_is_uncalibrated(build, make_chu
     reranker's name."""
     out = build({"x": "no idea"}).rerank("q", [make_chunk("c1", "x", score=0.3)], top_k=1)
     assert out[0].metadata[rr.CALIBRATED] is False
+
+
+# --- provenance: which link actually scored --------------------------------
+#
+# The 2026-09-02 calibration table mixed a generative 0/10 grade into Cohere's
+# range because nothing recorded which link answered. The chain now stamps it.
+
+
+def test_failover_records_the_link_that_answered(make_chunk):
+    chain = rr.FallbackReranker([_Boom(), _Fixed(0.8)], ["dead", "backup"])
+    out = chain.rerank("q", [make_chunk("c1")], top_k=1)
+    assert out[0].metadata[rr.RERANKED_BY] == "backup"
+
+
+def test_primary_answering_records_the_primary(make_chunk):
+    chain = rr.FallbackReranker([_Fixed(0.7), _Fixed(0.1)], ["primary", "backup"])
+    out = chain.rerank("q", [make_chunk("c1")], top_k=1)
+    assert out[0].metadata[rr.RERANKED_BY] == "primary"
+
+
+def test_whole_chain_down_records_none(make_chunk):
+    chain = rr.FallbackReranker([_Boom(), _Boom()], ["a", "b"])
+    out = chain.rerank("q", [make_chunk("c1")], top_k=1)
+    assert out[0].metadata[rr.RERANKED_BY] == "none"

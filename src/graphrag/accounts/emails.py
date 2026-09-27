@@ -11,6 +11,7 @@ from __future__ import annotations
 import abc
 
 import httpx
+from prometheus_client import Counter
 
 from graphrag.config.settings import Secrets, Settings
 from graphrag.core.logging import get_logger
@@ -18,6 +19,16 @@ from graphrag.core.logging import get_logger
 log = get_logger(__name__)
 
 _TIMEOUT = 10.0
+
+# A failed send is invisible from outside: signup answers "code sent" either way
+# (by design — see the module docstring), so the user just never gets a code and
+# the provider's dashboard shows nothing, because it never accepted the message.
+# This counter is the only aggregate signal that sign-up has quietly stopped.
+_SENDS = Counter(
+    "graphrag_email_send_total",
+    "Transactional email send attempts",
+    ["provider", "outcome"],  # outcome: sent | rejected | error | console
+)
 
 
 class EmailSender(abc.ABC):
@@ -34,6 +45,7 @@ class ConsoleSender(EmailSender):
     async def send(self, to: str, subject: str, text: str) -> bool:
         log.warning("email_not_sent", to=to, subject=subject, body=text,
                     hint="console email backend — configure RESEND_API_KEY to deliver")
+        _SENDS.labels(provider="console", outcome="console").inc()
         return True
 
 
@@ -53,10 +65,13 @@ class ResendSender(EmailSender):
             if r.status_code >= 400:
                 log.warning("email_send_failed", provider="resend",
                             status=r.status_code, body=r.text[:200])
+                _SENDS.labels(provider="resend", outcome="rejected").inc()
                 return False
+            _SENDS.labels(provider="resend", outcome="sent").inc()
             return True
         except Exception as exc:
             log.warning("email_send_error", provider="resend", error=str(exc))
+            _SENDS.labels(provider="resend", outcome="error").inc()
             return False
 
 
@@ -82,10 +97,13 @@ class BrevoSender(EmailSender):
             if r.status_code >= 400:
                 log.warning("email_send_failed", provider="brevo",
                             status=r.status_code, body=r.text[:200])
+                _SENDS.labels(provider="brevo", outcome="rejected").inc()
                 return False
+            _SENDS.labels(provider="brevo", outcome="sent").inc()
             return True
         except Exception as exc:
             log.warning("email_send_error", provider="brevo", error=str(exc))
+            _SENDS.labels(provider="brevo", outcome="error").inc()
             return False
 
 

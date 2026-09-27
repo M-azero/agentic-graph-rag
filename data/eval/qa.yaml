@@ -1,27 +1,122 @@
-# Golden Q&A over data/sample.md. Every question names the keywords a correct
-# answer must contain and the source file the evidence must come from.
+# Golden Q&A over data/sample.md, in three bands.
 #
-# Add cases for your own corpus the same way; `make eval` scores them all.
+# Two bands are the easy comparison — questions the corpus answers, and questions
+# about something else entirely. They sit far apart on the reranker's scale and
+# tell you almost nothing once the gate is roughly tuned.
+#
+# The third band is the one that matters: `near_miss`. Clean corpus vocabulary,
+# but the answer is NOT in the corpus. These score like real questions, so the
+# closed-domain gate cannot be relied on to catch them, and whether the system
+# stays honest depends on the agent admitting the gap. Scoring only the outer two
+# bands is what let `retrieval.min_relevance` get calibrated on a comparison that
+# never contained the interesting case.
+#
+# Fields:
+#   question         required
+#   band             in_corpus (default) | near_miss | off_topic
+#   expect_keywords  in_corpus: the answer must contain all of these
+#   expect_source    in_corpus: evidence must come from this file
+#   forbid_keywords  near_miss: tokens only a fabricated answer would contain.
+#                    Use sparingly — a correct refusal often names the entity it
+#                    is refusing to link (see the BluePeak case), so a substring
+#                    ban gives false positives more often than it catches a lie.
+#
+# Band expectations, enforced by scripts/eval.py:
+#   in_corpus  gate must PASS      (a refusal here is a false refusal)
+#   off_topic  gate must REFUSE    (an answer here is a bypass)
+#   near_miss  either — but if the gate passes, the answer must admit the fact
+#              is absent rather than invent it.
+
+# ---------------------------------------------------------------- in_corpus --
 - question: Who founded Acme Robotics?
+  band: in_corpus
   expect_keywords: [Dana Ruiz, Sam Okafor]
   expect_source: sample.md
 
 - question: What is the Pallet Pilot and who makes it?
+  band: in_corpus
   expect_keywords: [forklift, Acme]
   expect_source: sample.md
 
 - question: How are Acme Robotics and Riverside University connected?
+  band: in_corpus
   expect_keywords: [RouteMind]
   expect_source: sample.md
 
 - question: Where did Sam Okafor study and work before Acme?
+  band: in_corpus
   expect_keywords: [Riverside, Initech]
   expect_source: sample.md
 
 - question: Which company did Acme Robotics acquire, and why?
+  band: in_corpus
   expect_keywords: [GridSense, mapping]
   expect_source: sample.md
 
 - question: Who are Acme's competitors and what do they sell?
+  band: in_corpus
   expect_keywords: [Globex, HeavyHauler, BluePeak, SwiftLift]
   expect_source: sample.md
+
+# ---------------------------------------------------------------- near_miss --
+# Every one of these is built from names the corpus does use, asking for a fact
+# it never states. Measured with Cohere only, 2026-09-27: 6 of 10 are refused at
+# min_relevance 0.5 (scores 0.299 - 0.748, against 0.843 - 0.892 for in_corpus).
+# A reranker scores whether a passage ANSWERS the query, not whether it shares
+# its vocabulary, so absence depresses the score. The 4 that pass are the ones
+# where the corpus holds part of the answer — the topic, not the value — e.g.
+# "acquired GridSense in 2023" for "what did it pay". (An earlier count of 8 of
+# 10 came from a run where Cohere rate-limited and a generative reranker's
+# 0/10 grades refused questions Cohere would have passed.)
+- question: What did Acme Robotics pay to acquire GridSense?
+  band: near_miss
+
+- question: What is the Pallet Pilot's payload capacity?
+  band: near_miss
+
+- question: How many RouteMind units has Acme Robotics shipped?
+  band: near_miss
+
+- question: When did Dana Ruiz leave Globex to start Acme Robotics?
+  band: near_miss
+
+- question: Which LiDAR vendor supplies the sensor in the Pallet Pilot?
+  band: near_miss
+
+# The trap case, and the reason `forbid_keywords` is left empty here. The corpus
+# says BluePeak was founded by "a former Initech engineer" and separately that
+# Sam Okafor worked at Initech. Naming him is the fabrication; MENTIONING him in
+# order to rule him out is the correct answer. Both contain the same substring.
+- question: Which Initech engineer founded BluePeak?
+  band: near_miss
+
+- question: How does the SwiftLift's battery range compare to the Pallet Pilot's?
+  band: near_miss
+
+- question: How many people does Acme Robotics employ?
+  band: near_miss
+
+- question: What programming language is RouteMind written in?
+  band: near_miss
+
+- question: Which warehouse customers has Acme Robotics signed?
+  band: near_miss
+
+# ---------------------------------------------------------------- off_topic --
+- question: What is the best way to cook risotto?
+  band: off_topic
+
+- question: How do I resolve a git merge conflict?
+  band: off_topic
+
+- question: Who won the 2022 World Cup?
+  band: off_topic
+
+- question: Explain the difference between TCP and UDP.
+  band: off_topic
+
+- question: What are the symptoms of vitamin D deficiency?
+  band: off_topic
+
+- question: Write me a haiku about the sea.
+  band: off_topic

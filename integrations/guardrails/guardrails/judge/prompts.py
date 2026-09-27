@@ -141,9 +141,23 @@ def build_output_prompt(
     _, start, end = _delimiters()
     has_docs = bool(docs)
 
+    # "Unsupported by the context" and "contradicted by the context" are not the
+    # same thing, and a closed-domain RAG app lives on the difference. An answer
+    # that reports what the documents do NOT contain — a refusal, a hedge, "the
+    # corpus never names X" — is unsupportable by construction, because no
+    # document asserts its own gaps. Judged literally, the most honest possible
+    # answer to an unanswerable question scores as the most ungrounded one, and
+    # flag-first thresholds then punish precisely the behaviour a closed-domain
+    # system exists to produce. Measured on the graphrag corpus before this
+    # clause: a correct, cited refusal scored 0.80, rising to 0.95 — a block —
+    # once the supporting quotes around it were trimmed away.
     grounded_line = (
-        "ungrounded (how much of the answer is NOT supported by the provided context "
-        "documents; list unsupported_claims as verbatim quotes), "
+        "ungrounded (how much of the answer ASSERTS facts not supported by the "
+        "provided context documents; list unsupported_claims as verbatim quotes. "
+        "Statements about what the context does NOT contain — refusals, hedges, "
+        "'the documents do not say X' — are NOT ungrounded: correctly reporting a "
+        "gap is grounded behaviour. Score only the substantive claims the answer "
+        "actually makes), "
         if has_docs
         else "ungrounded (set 0 — no context documents were provided), "
     )

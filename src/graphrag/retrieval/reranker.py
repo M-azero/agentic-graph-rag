@@ -33,6 +33,10 @@ _LLM_PROVIDERS = (
 # similarities rather than calibrated relevance, which `retrieval.min_relevance`
 # must not be compared against — see `graphrag.api.routers.query`.
 CALIBRATED = "rerank_calibrated"
+# Stamped alongside it: which reranker actually produced the scores. A chain
+# names only what it COULD use; this names the link that answered, which is what
+# tells a Cohere score from a generative 0-10 grade after the fact.
+RERANKED_BY = "reranked_by"
 
 
 def _mark(chunks: list[RetrievedChunk], calibrated: bool) -> list[RetrievedChunk]:
@@ -97,7 +101,27 @@ class LLMReranker(Reranker):
     Quality depends entirely on the model returning a bare number, so `prompt`
     is config-exposed — a model that ignores it scores nothing, and those chunks
     fall back to their retrieval order rather than being dropped.
+
+    Ordering here is sound; the ABSOLUTE values are not comparable to a rerank
+    endpoint's. `_score` maps an integer 0-10 onto 0-1, so the output is eleven
+    discrete points clustered at the ends, while Cohere returns a continuous
+    relevance probability. Measured on identical candidates:
+
+        query                              cohere   generative
+        "Who founded Acme Robotics?"       0.8573       1.0000
+        "When did Dana Ruiz leave Globex"  0.6598       0.1000
+        "How do I resolve a merge conflict" 0.2671      0.0000
+
+    The middle row is the whole problem: against `min_relevance: 0.5` those two
+    numbers are opposite verdicts on the same question. So this reports itself
+    UNCALIBRATED and the closed-domain gate suspends rather than compare — the
+    same choice `NoOpReranker` makes, and for the same reason. Ranking still
+    works, so retrieval quality is unaffected; only the refuse/answer decision
+    steps aside, and it says so in the log (`relevance_gate_bypassed`).
     """
+
+    # Not on the gate's scale. See the class docstring.
+    calibrated = False
 
     def __init__(self, cfg: RerankCfg, secrets: Secrets) -> None:
         extra = dict(cfg.extra)
@@ -160,15 +184,20 @@ class LLMReranker(Reranker):
         unscored = [(c, c.score) for c, s in pairs if s is None]
         if unscored:
             log.warning("rerank_partial", scored=len(ranked), unscored=len(unscored))
-        # Nothing scored at all means every call failed: the "scores" below are
-        # raw retrieval values, so the gate must not read them as relevance.
+        # False either way. A failed rerank leaves raw retrieval values here, and
+        # a SUCCESSFUL one still returns a 0-10 grade rather than the relevance
+        # scale `min_relevance` is tuned on — see the class docstring. Marking a
+        # working generative rerank "calibrated" was the subtle case: it handed
+        # the gate plausible-looking numbers from the wrong distribution, and
+        # flipped refuse/answer verdicts every time Cohere rate-limited and the
+        # chain failed over to this link.
         return _mark([
             RetrievedChunk(
                 chunk_id=c.chunk_id, text=c.text, source=c.source,
                 score=float(s), retriever=c.retriever, metadata=c.metadata,
             )
             for c, s in (ranked + unscored)[:top_k]
-        ], bool(ranked))
+        ], False)
 
 
 class APIReranker(Reranker):
@@ -239,14 +268,21 @@ class FallbackReranker(Reranker):
             return []
         for index, member in enumerate(self._members):
             try:
-                return member.rerank(query, chunks, top_k)
+                ranked = member.rerank(query, chunks, top_k)
             except Exception as exc:
                 nxt = self._labels[index + 1] if index + 1 < len(self._labels) else "none"
                 log.warning(
                     "rerank_failover", failed=self._labels[index], next=nxt, error=str(exc)
                 )
+                continue
+            for chunk in ranked:
+                chunk.metadata[RERANKED_BY] = self._labels[index]
+            return ranked
         log.warning("rerank_unavailable", note="retrieval order only; relevance gate bypassed")
-        return _mark(chunks[:top_k], False)
+        ranked = _mark(chunks[:top_k], False)
+        for chunk in ranked:
+            chunk.metadata[RERANKED_BY] = "none"
+        return ranked
 
 
 def describe(reranker: Reranker) -> str:

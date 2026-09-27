@@ -100,21 +100,50 @@ retrieval:
   rerank:
     provider: cohere
     model: rerank-v4.0-fast
-    # The two fallbacks are THE SAME MODEL reached through two providers, and
-    # that is the point. Reranking feeds `min_relevance` below, which decides
-    # whether a question gets answered at all — so a fallback that scores on a
-    # different curve does not just reorder results, it changes which questions
-    # are refused. Identical weights score identically, so failing from link 2
-    # to link 3 is invisible to the gate. DeepInfra serves no reranker model of
-    # its own (only BGE embeddings), so these two are generative: a chat model
-    # rating each pair 0-10, normalized to 0-1.
+    # The two fallbacks are THE SAME MODEL reached through two providers, so
+    # failing from one to the other does not change the ordering. DeepInfra
+    # serves no reranker model of its own (only BGE embeddings), so both are
+    # generative: a chat model rating each pair 0-10, normalized to 0-1.
+    #
+    # That grade is NOT on Cohere's scale, so both links report themselves
+    # uncalibrated and the `min_relevance` gate below SUSPENDS whenever either
+    # one answers (`relevance_gate_bypassed` in the log,
+    # `graphrag_relevance_gate_total{outcome="bypassed"}` in metrics). Retrieval
+    # keeps working; only the refuse/answer decision steps aside and leaves it to
+    # the closed-domain agent. So any failover past Cohere turns the gate off,
+    # and a rate-limited Cohere key (a trial key allows 10 rerank calls/min, and
+    # a question spends at least two) turns it off under ordinary load.
     fallbacks:
       - { provider: deepseek,  model: deepseek-v4-flash }
       - { provider: deepinfra, model: deepseek-ai/DeepSeek-V4-Flash }
   # Closed-domain gate: refuse questions the knowledge base doesn't cover instead
-  # of answering from the LLM's general knowledge. Calibrated on this corpus with
-  # Cohere rerank-v4: in-topic questions score 0.70–0.89, off-topic 0.11–0.20, so
-  # 0.5 cleanly rejects off-topic while leaving margin for oblique real questions.
+  # of answering from the LLM's general knowledge. Calibrated with Cohere
+  # rerank-v4.0-fast ONLY — calls paced under the rate limit so no generative
+  # fallback could answer (2026-09-27; data/eval/qa.yaml over data/sample.md):
+  #
+  #   in_corpus  0.843 - 0.892   questions the corpus answers
+  #   near_miss  0.299 - 0.748   corpus vocabulary, answer NOT in the corpus
+  #   off_topic  0.101 - 0.267   nothing to do with the corpus
+  #
+  # An earlier table (2026-09-02) put near_miss at 0.0000 - 0.7488. That 0.0000
+  # was a generative 0/10 grade from a failover, not a Cohere score — the run
+  # mixed two scales, which is why eval.py now prints which reranker scored
+  # each question and flags a mixed run.
+  #
+  # 0.5 clears off_topic with room to spare. At 0.5, 6 of 10 near_miss
+  # questions are refused. The 4 that pass are the ones where the corpus holds
+  # the topic but not the value asked for ("acquired GridSense in 2023" vs "what
+  # did it pay"), and those reach the agent, which is prompted to say which fact
+  # is missing rather than invent it. That second line is the real defence.
+  #
+  # On this set a threshold near 0.80 would separate in_corpus from near_miss
+  # outright. Do not take that: it is 22 questions against a corpus that fits
+  # in ONE chunk, so every real question is scored against a passage holding the
+  # whole answer. On a real corpus, evidence spread over chunks scores lower
+  # (split into sentences here, multi-fact in_corpus questions fell to
+  # 0.34-0.58), and 0.80 would refuse legitimate questions. Re-measure on a
+  # representative corpus before raising it. `scripts/eval.py` is the check.
+  #
   # Lower it if legitimate questions get refused; raise it to be stricter.
   # If every reranker in the chain is down the scores are raw retrieval
   # similarities on a different scale, and the gate suspends itself rather than

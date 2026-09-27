@@ -12,7 +12,13 @@ from graphrag.retrieval.base import Retriever
 from graphrag.retrieval.fusion import reciprocal_rank_fusion
 from graphrag.retrieval.graph_augmented import GraphAugmentedRetriever
 from graphrag.retrieval.plan import active_plan
-from graphrag.retrieval.reranker import CALIBRATED, Reranker, describe
+from graphrag.retrieval.reranker import (
+    CALIBRATED,
+    RERANKED_BY,
+    FallbackReranker,
+    Reranker,
+    describe,
+)
 from graphrag.retrieval.vector import VectorRetriever
 from graphrag.storage.graph.base import GraphStore
 from graphrag.trace import step
@@ -106,9 +112,15 @@ class HybridRetriever(Retriever):
             top_k=k,
         ) as s:
             ranked = self._reranker.rerank(query, fused, k)
+            # A chain stamps the link that answered; a single reranker is its
+            # own answer.
+            if not isinstance(self._reranker, FallbackReranker):
+                for chunk in ranked:
+                    chunk.metadata[RERANKED_BY] = describe(self._reranker)
             before = {c.chunk_id: i for i, c in enumerate(fused)}
             s.output(
                 results=len(ranked),
+                answered_by=ranked[0].metadata.get(RERANKED_BY) if ranked else None,
                 calibrated=bool(ranked and ranked[0].metadata.get(CALIBRATED, True)),
                 top=[
                     {

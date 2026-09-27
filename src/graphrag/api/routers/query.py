@@ -8,6 +8,7 @@ import asyncio
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from prometheus_client import Counter
 from sqlalchemy import select
 from sse_starlette.sse import EventSourceResponse
 
@@ -133,6 +134,17 @@ def _review_citations(answer: str, result) -> tuple[list, CitationReport]:
             available=len(report.available),
         )
     return order_by_citation(result.sources, report), report
+
+
+# How often the closed-domain gate actually decides. `bypassed` is the one to
+# watch: every failover past the calibrated reranker (a rate-limited Cohere key
+# is enough) suspends the gate, and nothing user-visible says so — off-topic
+# questions simply start reaching the agent.
+_GATE = Counter(
+    "graphrag_relevance_gate_total",
+    "Closed-domain gate outcomes",
+    ["outcome"],  # passed | refused | bypassed | empty
+)
 
 
 def _gate_applies(probe) -> bool:
@@ -344,6 +356,11 @@ async def _gate(service, question, container, tenant, meter, shelf):
         probe = await _probe(service, question, tenant, meter, shelf)
         applies = bool(probe) and _gate_applies(probe)
         passed = bool(probe) and not (applies and probe[0].score < min_rel)
+        _GATE.labels(
+            outcome="empty" if not probe else
+            "bypassed" if not applies else
+            "passed" if passed else "refused"
+        ).inc()
         s.output(
             candidates=len(probe),
             top_score=round(probe[0].score, 4) if probe else None,

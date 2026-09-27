@@ -146,3 +146,40 @@ def test_no_probe_means_no_double_booking(bookings):
     assert service.meters == [service.meters[0]]  # only aanswer ran
     assert len(bookings) == 1
     assert bookings[0]["input_tokens"] == 1_000
+
+
+# --- the gate's outcome is counted ------------------------------------------
+#
+# A suspended gate is silent to users: off-topic questions just start reaching
+# the agent. `graphrag_relevance_gate_total{outcome}` is how an operator sees
+# that a rate-limited reranker has switched it off.
+
+
+class _UncalibratedService(_Service):
+    def search(self, query, k=8, user_id=None, meter=None, shelf=None):
+        chunks = super().search(query, k, user_id, meter, shelf)
+        for c in chunks:
+            c.metadata["rerank_calibrated"] = False
+        return chunks
+
+
+def _gate_count(outcome: str) -> float:
+    from prometheus_client import REGISTRY
+
+    return REGISTRY.get_sample_value(
+        "graphrag_relevance_gate_total", {"outcome": outcome}
+    ) or 0.0
+
+
+@pytest.mark.parametrize(
+    ("service", "outcome"),
+    [
+        (_Service(top_score=0.9), "passed"),
+        (_Service(top_score=0.01), "refused"),
+        (_UncalibratedService(top_score=0.01), "bypassed"),
+    ],
+)
+def test_each_gate_outcome_is_counted(bookings, service, outcome):
+    before = _gate_count(outcome)
+    _ask(_client(service))
+    assert _gate_count(outcome) == before + 1
